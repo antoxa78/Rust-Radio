@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "A GTK4 internet radio player using radio-browser.info"
 authors = ["Rust Radio"]
+repository = "https://github.com/antoxa78/rust-radio-gtk"
+homepage = "https://github.com/antoxa78/rust-radio-gtk"
 
 [package.metadata.deb]
 name = "rust-radio-gtk"
