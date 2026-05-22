@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Rust Radio
+Comment=GTK4 internet radio player
+Exec=rust-radio-gtk
+Icon=rust-radio-gtk
+Categories=AudioVideo;Audio;Music;Player;
+Terminal=false
+StartupNotify=true

@@ -1,0 +1,46 @@
+[package]
+name = "rust-radio-gtk"
+version = "0.1.8"
+edition = "2021"
+description = "A GTK4 internet radio player using radio-browser.info"
+authors = ["Rust Radio"]
+repository = "https://github.com/antoxa78/rust-radio-gtk"
+homepage = "https://github.com/antoxa78/rust-radio-gtk"
+
+[package.metadata.deb]
+name = "rust-radio-gtk"
+maintainer = "Antoxa <anton.b1978@gmail.com>"
+copyright = "2026 Rust Radio"
+license-file = ["LICENSE", "64"]
+extended-description = """A GTK4-based internet radio player that browses and plays stations from the radio-browser.info database.
+Features include browsing by tag, language, country, favorites, recently played, and playlist import."""
+section = "sound"
+priority = "optional"
+maintainer-scripts = "debian/"
+assets = [
+    ["target/release/rust-radio-gtk", "usr/bin/", "755"],
+    ["rust-radio-gtk.desktop", "usr/share/applications/", "644"],
+    ["assets/icon-48.png", "usr/share/icons/hicolor/48x48/apps/rust-radio-gtk.png", "644"],
+    ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/rust-radio-gtk.png", "644"],
+    ["assets/icon-512.png", "usr/share/icons/hicolor/512x512/apps/rust-radio-gtk.png", "644"],
+]
+depends = "$auto"
+
+[dependencies]
+# UI Stack
+gtk = { version = "0.9", package = "gtk4" }
+adw = { version = "0.7", package = "libadwaita" }
+glib = "0.19"
+
+# Media Engine
+gstreamer = "0.22"
+
+# Networking & Async
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+urlencoding = "2.1"
+async-channel = "2.3"
+dirs = "6.0.0"
+serde_json = "1.0.149"
+directories = "5.0"
