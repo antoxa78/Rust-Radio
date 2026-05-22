@@ -1432,14 +1432,70 @@ fn build_ui(app: &Application) {
         page.add(&stats_group);
         page.add(&audio_group);
 
-        let about_group = PreferencesGroup::builder()
-            .title("About")
-            .description(&format!(
-                "Rust Radio GTK v{}\nBuilt: {}",
-                env!("CARGO_PKG_VERSION"),
-                option_env!("BUILD_DATETIME").unwrap_or("unknown"),
-            ))
+        let about_group = PreferencesGroup::builder().title("About").build();
+        let about_row = ActionRow::builder()
+            .title(format!("Rust Radio GTK v{}", env!("CARGO_PKG_VERSION")))
+            .subtitle(option_env!("BUILD_DATETIME").unwrap_or("unknown"))
+            .activatable(true)
             .build();
+        let parent_window = window_parent_hook.root().unwrap().downcast::<gtk::Window>().unwrap();
+        about_row.connect_activated(move |_| {
+            let dialog = gtk::Window::builder()
+                .title("About")
+                .transient_for(&parent_window)
+                .modal(true)
+                .default_width(420)
+                .default_height(280)
+                .resizable(false)
+                .build();
+            let content = Box::builder()
+                .orientation(Orientation::Vertical)
+                .spacing(12)
+                .margin_top(24).margin_bottom(24).margin_start(24).margin_end(24)
+                .build();
+            let app_label = Label::builder()
+                .label(&format!("Rust Radio GTK v{}", env!("CARGO_PKG_VERSION")))
+                .css_classes(vec!["title-1".to_string()])
+                .halign(gtk::Align::Center)
+                .build();
+            let desc_label = Label::builder()
+                .label("A GTK4 internet radio player that browses and plays\nstations from the radio-browser.info database.")
+                .css_classes(vec!["body".to_string()])
+                .halign(gtk::Align::Center)
+                .justify(gtk::Justification::Center)
+                .wrap(true)
+                .build();
+            let build_label = Label::builder()
+                .label(option_env!("BUILD_DATETIME").unwrap_or("unknown"))
+                .css_classes(vec!["caption".to_string()])
+                .halign(gtk::Align::Center)
+                .build();
+            let copyright_label = Label::builder()
+                .label("© 2026 Antoxa")
+                .css_classes(vec!["caption".to_string()])
+                .halign(gtk::Align::Center)
+                .build();
+            let license_label = Label::builder()
+                .label("Licensed under the GNU General Public License v3.0")
+                .css_classes(vec!["caption".to_string()])
+                .halign(gtk::Align::Center)
+                .build();
+            let website_link = Label::builder()
+                .label("<a href=\"https://github.com/antoxa78/rust-radio-gtk\">github.com/antoxa78/rust-radio-gtk</a>")
+                .use_markup(true)
+                .css_classes(vec!["caption".to_string()])
+                .halign(gtk::Align::Center)
+                .build();
+            content.append(&app_label);
+            content.append(&desc_label);
+            content.append(&build_label);
+            content.append(&copyright_label);
+            content.append(&license_label);
+            content.append(&website_link);
+            dialog.set_child(Some(&content));
+            dialog.present();
+        });
+        about_group.add(&about_row);
         page.add(&group);
 
         page.add(&about_group);
