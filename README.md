@@ -7,12 +7,14 @@ A GTK4 internet radio player that browses and plays stations from the [radio-bro
 - Browse stations by **tag**, **language**, or **country**
 - **Search** stations by name
 - **Top Voted** stations
-- **Favorites** and **Recently Played** history
+- **Favorites** and **Recently Played** history (persisted to disk)
 - **Custom tags** — pin frequently used tags to the sidebar
 - **Playlist import** (M3U/PLS)
-- Bitrate filtering
+- **Bitrate filtering** (Any / Low ≤160 / High ≥192 / FLAC)
 - Sort by name (A–Z / Z–A)
 - Auto-update background refresh (configurable, 6h interval)
+- **Batch-rendered lists** — station rows rendered in small idle batches for a smooth, responsive UI even with 250 stations
+- **Cached categories** — tags, languages, and countries cached after first fetch
 
 ## Build from source
 
@@ -38,7 +40,7 @@ cargo build --release
 
 ```bash
 cargo deb
-sudo dpkg -i target/debian/rust-radio-gtk_0.1.0-1_amd64.deb
+sudo dpkg -i target/debian/rust-radio-gtk_0.1.8-1_amd64.deb
 ```
 
 ### Manual
