@@ -2258,26 +2258,25 @@ fn build_ui(app: &Application) {
     play_pause_btn.connect_clicked(move |btn| {
         let ui = ui_play_pause.lock().unwrap();
         let current = ui.current_index;
-        let state = state_play_pause.lock().unwrap();
+        let mode = ui.current_view.clone();
+        drop(ui);
+        let mut state = state_play_pause.lock().unwrap();
         if state.currently_playing_station.is_some() {
             if !state.is_paused {
                 let _ = state.pipeline.as_ref().unwrap().set_state(gstreamer::State::Paused);
-                let mut s = state_play_pause.lock().unwrap();
-                s.is_paused = true;
+                state.is_paused = true;
                 btn.set_icon_name("media-playback-start-symbolic");
             } else {
                 let _ = state.pipeline.as_ref().unwrap().set_state(gstreamer::State::Playing);
-                let mut s = state_play_pause.lock().unwrap();
-                s.is_paused = false;
+                state.is_paused = false;
                 btn.set_icon_name("media-playback-pause-symbolic");
             }
         } else {
-            let mode = ui.current_view.clone();
+            drop(state);
             match mode {
                 ViewType::Stations | ViewType::Favorites | ViewType::Recent | ViewType::Playlists | ViewType::CustomTag(_) => {
                     if let Some(idx) = current {
-                        if idx < ui.stations.len() {
-                            drop(ui);
+                        if idx < ui_play_pause.lock().unwrap().stations.len() {
                             play_station(&state_play_pause, &ui_play_pause, idx, &btn_play_pause_clone, &np_title_ctrl, &np_sub_ctrl, &meta_lbl_ctrl, &info_lbl_ctrl, &fav_toggle_ctrl, &flag_lbl_ctrl, &save_mgr_play_pause, &prefs_play_pause);
                         }
                     }
