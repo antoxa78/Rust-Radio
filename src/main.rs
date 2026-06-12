@@ -64,6 +64,8 @@ struct AppPreferences {
     analyzer_type: AnalyzerType,
     custom_tags: Vec<String>,
     audio_sink: String,
+    disable_video_streams: bool,
+    disable_audio_buffer: bool,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -128,6 +130,12 @@ fn default_bitrate_str() -> String { "None".to_string() }
 
 fn default_audio_sink() -> String { "autoaudiosink".to_string() }
 
+fn default_disable_video_streams() -> bool { false }
+
+fn default_disable_audio_buffer() -> bool { false }
+
+fn default_analyzer_type() -> String { "BlocksWithHold".to_string() }
+
 #[derive(Serialize, Deserialize, Default)]
 struct SavedData {
     favorites: Vec<Station>,
@@ -142,6 +150,12 @@ struct SavedData {
     playlists: Vec<Station>,
     #[serde(default = "default_audio_sink")]
     audio_sink: String,
+    #[serde(default = "default_disable_video_streams")]
+    disable_video_streams: bool,
+    #[serde(default = "default_disable_audio_buffer")]
+    disable_audio_buffer: bool,
+    #[serde(default = "default_analyzer_type")]
+    analyzer_type: String,
 }
 
 struct AppState {
@@ -171,6 +185,14 @@ impl AppState {
         let prefs = self.prefs.lock().unwrap();
         let custom_tags = prefs.custom_tags.clone();
         let audio_sink = prefs.audio_sink.clone();
+        let disable_video_streams = prefs.disable_video_streams;
+        let disable_audio_buffer = prefs.disable_audio_buffer;
+        let analyzer_type = match prefs.analyzer_type {
+            AnalyzerType::Bars => "Bars",
+            AnalyzerType::Wave => "Wave",
+            AnalyzerType::BlocksWithHold => "BlocksWithHold",
+            AnalyzerType::DigitalVuBlocks => "DigitalVuBlocks",
+        }.to_string();
         drop(prefs);
 
         let data = SavedData {
@@ -181,6 +203,9 @@ impl AppState {
             last_sync_timestamp,
             playlists,
             audio_sink,
+            disable_video_streams,
+            disable_audio_buffer,
+            analyzer_type,
         };
 
         if let Ok(json) = serde_json::to_string(&data) {
@@ -209,6 +234,27 @@ fn main() {
 
     application.connect_activate(build_ui);
     application.run();
+}
+
+/// Calculate adaptive buffer duration based on stream bitrate
+/// Lower bitrate streams need more buffering time
+fn calculate_adaptive_buffer(bitrate_kbps: Option<u32>) -> i64 {
+    match bitrate_kbps {
+        Some(bitrate) => {
+            let duration_seconds = match bitrate {
+                0..=96 => 20,        // Low bitrate (64-96 kbps): 20 seconds
+                97..=192 => 15,      // Medium bitrate (128-192 kbps): 15 seconds
+                193..=320 => 10,     // High bitrate (256-320 kbps): 10 seconds
+                _ => 8,              // Very high bitrate (>320 kbps): 8 seconds
+            };
+            eprintln!("📊 Adaptive Buffer: {} kbps → {} seconds buffer", bitrate, duration_seconds);
+            duration_seconds * 1_000_000_000i64  // Convert to nanoseconds
+        }
+        None => {
+            eprintln!("📊 Adaptive Buffer: Unknown bitrate → 10 seconds buffer (default)");
+            10_000_000_000i64  // Default 10 seconds
+        }
+    }
 }
 
 fn play_station(
@@ -294,6 +340,7 @@ fn play_station(
 
     let url = station.url_resolved.clone();
     let sink_name = prefs.lock().unwrap().audio_sink.clone();
+    let disable_video = prefs.lock().unwrap().disable_video_streams;
     player.bus_guard = None;
     if let Some(old_pipeline) = player.pipeline.take() {
         let _ = old_pipeline.set_state(gstreamer::State::Null);
@@ -303,14 +350,36 @@ fn play_station(
         .or_else(|_| gstreamer::ElementFactory::make("autoaudiosink").build())
         .ok();
 
-    let mut playbin_builder = gstreamer::ElementFactory::make("playbin")
-        .property("uri", &url);
+    let video_sink = if disable_video {
+        gstreamer::ElementFactory::make("fakesink").build().ok()
+    } else {
+        None
+    };
+
+        let disable_buffer = prefs.lock().unwrap().disable_audio_buffer;
+        let buffer_duration = if disable_buffer {
+            0
+        } else {
+            calculate_adaptive_buffer(station.bitrate)
+        };
+        let mut playbin_builder = gstreamer::ElementFactory::make("playbin")
+        .property("uri", &url)
+        .property("buffer-duration", buffer_duration);  // Adaptive buffer based on bitrate
     if let Some(ref sink) = audio_sink {
         playbin_builder = playbin_builder.property("audio-sink", sink);
     }
-    if let Ok(pipeline) = playbin_builder.build()
+    
+    // Disable video streams if preference is enabled
+    if let Some(ref sink) = video_sink {
+        playbin_builder = playbin_builder.property("video-sink", sink);
+    }
+    
+     if let Ok(pipeline) = playbin_builder.build()
     {
-        let _ = pipeline.set_state(gstreamer::State::Playing);
+        let buffer_disabled = prefs.lock().unwrap().disable_audio_buffer;
+
+        // Start in PAUSED state for prebuffering, or PLAYING if buffer is disabled
+        let _ = pipeline.set_state(if buffer_disabled { gstreamer::State::Playing } else { gstreamer::State::Paused });
         let bus = pipeline.bus().unwrap();
         let meta_rc = player.current_metadata.clone();
         let label_rc = stream_meta_label.clone();
@@ -326,9 +395,29 @@ fn play_station(
         let flag_lbl_fallback = now_playing_flag_lbl.clone();
         let save_mgr_fallback = save_mgr.clone();
         let prefs_fallback = prefs.clone();
+        let pipeline_for_buffering = Arc::new(Mutex::new(pipeline.clone()));
 
         let guard = bus.add_watch_local(move |_, msg| {
             match msg.view() {
+                gstreamer::MessageView::Buffering(buffering_msg) => {
+                    let percent = buffering_msg.percent();
+                    eprintln!("Buffering: {}%", percent);
+                    
+                    if buffer_disabled {
+                        return glib::ControlFlow::Continue;
+                    }
+                    
+                    // Display buffering progress in the label
+                    label_rc.set_text(&format!("⏳ Buffering: {}%", percent));
+                    
+                    // When buffering reaches 100%, start playback
+                    if percent == 100 {
+                        label_rc.set_text("♫ Live Stream");
+                        if let Ok(pipeline) = pipeline_for_buffering.lock() {
+                            let _ = pipeline.set_state(gstreamer::State::Playing);
+                        }
+                    }
+                }
                 gstreamer::MessageView::Tag(tags_msg) => {
                     let tags = tags_msg.tags();
                     let mut meta = meta_rc.lock().unwrap();
@@ -340,6 +429,7 @@ fn play_station(
                     }
                     if let Some(bitrate) = tags.index::<gstreamer::tags::Bitrate>(0) {
                         meta.bitrate = Some(bitrate.get());
+                        eprintln!("🎵 Stream Bitrate Detected: {} kbps", bitrate.get());
                     }
                     if meta.codec.is_none() {
                         if let Some(codec) = tags.index::<gstreamer::tags::AudioCodec>(0) {
@@ -778,9 +868,16 @@ fn build_ui(app: &Application) {
         prefer_high_bitrate: true, 
         hide_broken: true, 
         auto_update: true,
-        analyzer_type: AnalyzerType::BlocksWithHold,
+        analyzer_type: match saved_data.analyzer_type.as_str() {
+            "Bars" => AnalyzerType::Bars,
+            "Wave" => AnalyzerType::Wave,
+            "DigitalVuBlocks" => AnalyzerType::DigitalVuBlocks,
+            _ => AnalyzerType::BlocksWithHold,
+        },
         custom_tags: saved_data.custom_tags,
         audio_sink: saved_data.audio_sink,
+        disable_video_streams: saved_data.disable_video_streams,
+        disable_audio_buffer: saved_data.disable_audio_buffer,
     }));
     
     let last_sync_ts = if saved_data.last_sync_timestamp.is_empty() {
@@ -1171,11 +1268,6 @@ fn build_ui(app: &Application) {
                     cr.arc(x + bar_width / 2.0, y + bar_h, bar_width / 2.0, 0.0, std::f64::consts::PI);
                     cr.close_path();
                     let _ = cr.fill();
-
-                    let p_h = (peaks[i] / 50.0) * height as f64;
-                    let p_y = (height as f64 - p_h) / 2.0;
-                    cr.rectangle(x, p_y - 1.0, bar_width, 2.0);
-                    let _ = cr.fill();
                 }
             }
             AnalyzerType::Wave => {
@@ -1339,7 +1431,7 @@ fn build_ui(app: &Application) {
     let (tx, rx) = async_channel::unbounded::<IncomingData>();
 
     let window_parent_hook = content_box.clone();
-    let prefs_window_ref = app_prefs.clone();
+     let prefs_window_ref = app_prefs.clone();
     let ui_telemetry_ref = ui_state.clone();
     let tx_sync_prefs = tx.clone();
     let prefs_sync_prefs = app_prefs.clone();
@@ -1351,6 +1443,7 @@ fn build_ui(app: &Application) {
     let prefs_restore_ref = app_prefs.clone();
     let _app_state_backup_ref = app_state_manager.clone();
     let app_state_restore_ref = app_state_manager.clone();
+    let app_state_prefs_close_ref = app_state_manager.clone();
 
     settings_btn.connect_clicked(move |_| {
         menu_popover.popdown();
@@ -1360,12 +1453,12 @@ fn build_ui(app: &Application) {
             .modal(true).build();
 
         let page = PreferencesPage::new();
-        let group = PreferencesGroup::builder().title("System Processing & UI Aesthetics").build();
+        let group = PreferencesGroup::builder().title("System Processing &amp; UI Aesthetics").build();
         let current_state = prefs_window_ref.lock().unwrap();
         let current_ui = ui_telemetry_ref.lock().unwrap();
 
         let stats_group = PreferencesGroup::builder()
-            .title("Database Statistics & Cache Lifecycle Telemetry")
+            .title("Database Statistics &amp; Cache Lifecycle Telemetry")
             .description(&format!(
                 "Total Stations Loaded: {}\nLast Radio-Browser Sync: {}\nActive Buffer Payload Allocation: {} index maps stored.",
                 current_ui.last_stations_updated_count,
@@ -1460,11 +1553,27 @@ fn build_ui(app: &Application) {
         });
         audio_group.add(&sink_row);
 
+        let disable_video_active = prefs_window_ref.lock().unwrap().disable_video_streams;
+        let disable_video_row = ActionRow::builder().title("Disable Video Streams (Audio Only)").build();
+        let video_switch = Switch::builder().active(disable_video_active).valign(gtk::Align::Center).build();
+        let video_save = prefs_window_ref.clone();
+        video_switch.connect_active_notify(move |sw| { video_save.lock().unwrap().disable_video_streams = sw.is_active(); });
+        disable_video_row.add_suffix(&video_switch);
+
+        let disable_buffer_active = prefs_window_ref.lock().unwrap().disable_audio_buffer;
+        let disable_buffer_row = ActionRow::builder().title("Disable Audio Buffer (Faster Start)").build();
+        let buffer_switch = Switch::builder().active(disable_buffer_active).valign(gtk::Align::Center).build();
+        let buffer_save = prefs_window_ref.clone();
+        buffer_switch.connect_active_notify(move |sw| { buffer_save.lock().unwrap().disable_audio_buffer = sw.is_active(); });
+        disable_buffer_row.add_suffix(&buffer_switch);
+        audio_group.add(&disable_buffer_row);
+
         group.add(&sync_row);
         group.add(&high_quality_row);
         group.add(&broken_row);
         group.add(&auto_update_row);
         group.add(&analyzer_row);
+        group.add(&disable_video_row);
 
         page.add(&stats_group);
         page.add(&audio_group);
@@ -1823,6 +1932,13 @@ fn build_ui(app: &Application) {
 
         page.add(&about_group);
         prefs_window.add(&page);
+        
+        let prefs_close_save = app_state_prefs_close_ref.clone();
+        prefs_window.connect_close_request(move |_| {
+            prefs_close_save.save_data();
+            adw::glib::signal::Propagation::Proceed
+        });
+        
         prefs_window.present();
     });
 

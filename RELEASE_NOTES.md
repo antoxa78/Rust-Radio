@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.1.0
+
+### New Features
+- **Audio Buffer Settings**: Added "Disable Audio Buffer (Faster Start)" toggle in Preferences → Audio Output
+  - Disabling the buffer skips GStreamer prebuffering, starting playback immediately
+  - Useful for low-latency listening or when buffering causes stream delays
+
+### Packaging
+- Debian `.deb` packaging via `cargo deb` with version tracking
+
 ## v0.1.8
 
 ### Project Renamed
