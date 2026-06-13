@@ -169,6 +169,8 @@ struct SavedData {
     analyzer_type: String,
     #[serde(default = "default_volume")]
     volume: f64,
+    #[serde(default)]
+    last_stations_loaded: usize,
 }
 
 struct AppState {
@@ -187,6 +189,7 @@ impl AppState {
         let favorites = ui.favorites.clone();
         let recent_stations = ui.recent_stations.clone();
         let last_sync_timestamp = ui.last_update_timestamp.clone();
+        let last_stations_loaded = ui.last_stations_updated_count;
         let playlists = ui.playlists.clone();
         let active_bitrate = match ui.active_bitrate {
             BitrateFilterSetting::None => "None",
@@ -221,6 +224,7 @@ impl AppState {
             disable_audio_buffer,
             analyzer_type,
             volume,
+            last_stations_loaded,
         };
 
         if let Ok(json) = serde_json::to_string(&data) {
@@ -1021,8 +1025,8 @@ fn build_ui(app: &Application) {
         },
         last_fetched_url: "https://de1.api.radio-browser.info/json/tags?order=stationcount&reverse=true&hidebroken=true".to_string(),
         last_update_timestamp: last_sync_ts.clone(),
-        total_elements_fetched: 0,
-        last_stations_updated_count: 0,
+        total_elements_fetched: saved_data.last_stations_loaded,
+        last_stations_updated_count: saved_data.last_stations_loaded,
         cached_tags: None,
         cached_languages: None,
         cached_countries: None,
@@ -1608,9 +1612,8 @@ fn build_ui(app: &Application) {
             let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
             ui.last_fetched_url = url.clone();
             let view = ui.current_view.clone();
-            let is_stations = !matches!(view, ViewType::Tags | ViewType::Languages | ViewType::Countries);
             drop(ui);
-            fetch_data_async(url, is_stations, view, sync_prefs.clone(), sync_tx.clone());
+            fetch_data_async(url, true, view, sync_prefs.clone(), sync_tx.clone());
         });
         sync_row.add_suffix(&sync_btn);
 
