@@ -1751,7 +1751,12 @@ fn build_ui(app: &Application) {
                 .keep_aspect_ratio(true)
                 .can_shrink(true)
                 .build();
-            logo.set_filename(Some("assets/icon-256.png"));
+            let icon_path = if std::path::Path::new("/usr/share/icons/hicolor/256x256/apps/rust-radio.png").exists() {
+                "/usr/share/icons/hicolor/256x256/apps/rust-radio.png"
+            } else {
+                "assets/icon-256.png"
+            };
+            logo.set_filename(Some(icon_path));
             let app_label = Label::builder()
                 .label(&format!("Rust Radio v{}", env!("CARGO_PKG_VERSION")))
                 .css_classes(vec!["title-1".to_string()])
