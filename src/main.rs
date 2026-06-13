@@ -7,6 +7,7 @@ use adw::{ActionRow, ApplicationWindow, HeaderBar, PreferencesGroup, Preferences
 use gtk::{Application, Box, Button, DrawingArea, Label, ListBox, MenuButton, Orientation, Paned, Popover, Scale, ScrolledWindow, SearchEntry, Switch, StringList};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::collections::HashSet;
@@ -14,6 +15,14 @@ use std::time::Duration;
 
 fn make_stats_label() -> Rc<RefCell<Option<gtk::Label>>> {
     Rc::new(RefCell::new(None))
+}
+
+static SCROLL_TO_ROW: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RENDER_GEN: AtomicUsize = AtomicUsize::new(0);
+
+fn station_limit() -> &'static AtomicUsize {
+    static LIMIT: OnceLock<AtomicUsize> = OnceLock::new();
+    LIMIT.get_or_init(|| AtomicUsize::new(250))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -651,7 +660,7 @@ fn format_time(duration: Duration) -> String {
 
 enum IncomingData {
     Categories(ViewType, Vec<BrowseItem>),
-    Stations(Vec<Station>, String),   // String = server DB last-change time from radio-browser.info
+    Stations(Vec<Station>, String, bool),   // String = server DB last-change time, bool = is_load_more
 }
 
 /// Resolve `all.api.radio-browser.info` via DNS, reverse-lookup each IP to
@@ -734,6 +743,7 @@ fn fetch_data_async(
     target_view: ViewType,
     prefs: Arc<Mutex<AppPreferences>>,
     tx: async_channel::Sender<IncomingData>,
+    is_load_more: bool,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -746,10 +756,14 @@ fn fetch_data_async(
 
             if is_stations {
                 let sep = |u: &str| if u.contains('?') { "&" } else { "?" };
-                if config.hide_broken {
+                if !url.contains("limit=") {
+                    station_limit().store(250, Ordering::Relaxed);
+                    url.push_str(&format!("{}limit=250", sep(&url)));
+                }
+                if config.hide_broken && !url.contains("lastcheckok=") {
                     url.push_str(&format!("{}lastcheckok=1", sep(&url)));
                 }
-                if config.prefer_high_bitrate {
+                if config.prefer_high_bitrate && !url.contains("order=") {
                     url.push_str(&format!("{}order=bitrate&reverse=true", sep(&url)));
                 }
             }
@@ -775,6 +789,7 @@ fn fetch_data_async(
                         let _ = tx.send_blocking(IncomingData::Stations(
                             stations,
                             sync_time,
+                            is_load_more,
                         ));
                     }
                 }
@@ -1613,7 +1628,7 @@ fn build_ui(app: &Application) {
             ui.last_fetched_url = url.clone();
             let view = ui.current_view.clone();
             drop(ui);
-            fetch_data_async(url, true, view, sync_prefs.clone(), sync_tx.clone());
+            fetch_data_async(url, true, view, sync_prefs.clone(), sync_tx.clone(), false);
         });
         sync_row.add_suffix(&sync_btn);
 
@@ -1699,10 +1714,10 @@ fn build_ui(app: &Application) {
 
         group.add(&sync_row);
         group.add(&high_quality_row);
+        group.add(&disable_video_row);
         group.add(&broken_row);
         group.add(&auto_update_row);
         group.add(&analyzer_row);
-        group.add(&disable_video_row);
 
         page.add(&stats_group);
         page.add(&audio_group);
@@ -2195,7 +2210,7 @@ fn build_ui(app: &Application) {
                     list_box_tag_btn.remove(&child);
                 }
                 browsing_tag_btn.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::CustomTag(tag_click.clone()), prefs_c.clone(), tx_c.clone());
+                fetch_data_async(url, true, ViewType::CustomTag(tag_click.clone()), prefs_c.clone(), tx_c.clone(), false);
             });
             let rm_btn = Button::builder()
                 .icon_name("window-close-symbolic")
@@ -2234,7 +2249,7 @@ fn build_ui(app: &Application) {
         ui.last_fetched_url = target_url.clone();
         ui.active_category = CategoryFilter::None;
         drop(ui);
-        fetch_data_async(target_url, false, ViewType::Tags, prefs_tag.clone(), tx_tag.clone());
+        fetch_data_async(target_url, false, ViewType::Tags, prefs_tag.clone(), tx_tag.clone(), false);
     });
 
     let back_ui = ui_state.clone();
@@ -2261,7 +2276,7 @@ fn build_ui(app: &Application) {
                         let _ = back_tx.send_blocking(IncomingData::Categories(prev, items));
                     } else {
                         drop(ui);
-                        fetch_data_async(url, false, prev, back_prefs.clone(), back_tx.clone());
+                        fetch_data_async(url, false, prev, back_prefs.clone(), back_tx.clone(), false);
                     }
                 }
                 ViewType::CustomTag(ref tag) => {
@@ -2276,14 +2291,14 @@ fn build_ui(app: &Application) {
                         back_list.remove(&child);
                     }
                     back_browsing.set_text("Loading stations...");
-                    fetch_data_async(cat_url, true, ViewType::CustomTag(tag), back_prefs.clone(), back_tx.clone());
+                    fetch_data_async(cat_url, true, ViewType::CustomTag(tag), back_prefs.clone(), back_tx.clone(), false);
                 }
                 ViewType::Stations => {
                     let cat_url = build_filtered_url(&ui.active_category, ui.active_bitrate);
                     ui.current_view = ViewType::Stations;
                     ui.last_fetched_url = cat_url.clone();
                     drop(ui);
-                    fetch_data_async(cat_url, true, ViewType::Stations, back_prefs.clone(), back_tx.clone());
+                    fetch_data_async(cat_url, true, ViewType::Stations, back_prefs.clone(), back_tx.clone(), false);
                 }
                 ViewType::Favorites => {
                     let stations = ui.favorites.clone();
@@ -2292,7 +2307,7 @@ fn build_ui(app: &Application) {
                     ui.last_fetched_url = url.clone();
                     drop(ui);
                     back_browsing.set_text("Favorite Stations");
-                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new()));
+                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new(), false));
                 }
                 ViewType::Recent => {
                     let stations = ui.recent_stations.clone();
@@ -2301,7 +2316,7 @@ fn build_ui(app: &Application) {
                     ui.last_fetched_url = url.clone();
                     drop(ui);
                     back_browsing.set_text("Recently Played");
-                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new()));
+                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new(), false));
                 }
                 ViewType::Playlists => {
                     let stations = ui.playlists.clone();
@@ -2310,7 +2325,7 @@ fn build_ui(app: &Application) {
                     ui.last_fetched_url = url.clone();
                     drop(ui);
                     back_browsing.set_text("Imported Playlist");
-                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new()));
+                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new(), false));
                 }
             }
         }
@@ -2330,7 +2345,7 @@ fn build_ui(app: &Application) {
         ui.last_fetched_url = target_url.clone();
         ui.active_category = CategoryFilter::None;
         drop(ui);
-        fetch_data_async(target_url, false, ViewType::Languages, prefs_lang.clone(), tx_lang.clone());
+        fetch_data_async(target_url, false, ViewType::Languages, prefs_lang.clone(), tx_lang.clone(), false);
     });
 
     let tx_country = tx.clone(); let prefs_country = app_prefs.clone(); let ui_country = ui_state.clone();
@@ -2347,7 +2362,7 @@ fn build_ui(app: &Application) {
         ui.last_fetched_url = target_url.clone();
         ui.active_category = CategoryFilter::None;
         drop(ui);
-        fetch_data_async(target_url, false, ViewType::Countries, prefs_country.clone(), tx_country.clone());
+        fetch_data_async(target_url, false, ViewType::Countries, prefs_country.clone(), tx_country.clone(), false);
     });
 
     let list_box_search = list_box.clone();
@@ -2368,7 +2383,7 @@ fn build_ui(app: &Application) {
                 list_box_search.remove(&child);
             }
             browsing_search.set_text("Loading stations...");
-            fetch_data_async(target_url, true, ViewType::Stations, prefs_search.clone(), tx_search.clone());
+            fetch_data_async(target_url, true, ViewType::Stations, prefs_search.clone(), tx_search.clone(), false);
         }
     });
 
@@ -2393,7 +2408,7 @@ fn build_ui(app: &Application) {
                 } else {
                     ui.stations.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.stations.clone(), ui.last_update_timestamp.clone()));
+                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.stations.clone(), ui.last_update_timestamp.clone(), false));
             }
             ViewType::Playlists => {
                 if asc {
@@ -2401,7 +2416,7 @@ fn build_ui(app: &Application) {
                 } else {
                     ui.playlists.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.playlists.clone(), ui.last_update_timestamp.clone()));
+                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.playlists.clone(), ui.last_update_timestamp.clone(), false));
             }
             ViewType::Favorites => {
                 if asc {
@@ -2409,7 +2424,7 @@ fn build_ui(app: &Application) {
                 } else {
                     ui.favorites.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.favorites.clone(), ui.last_update_timestamp.clone()));
+                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.favorites.clone(), ui.last_update_timestamp.clone(), false));
             }
             ViewType::Recent => {
                 if asc {
@@ -2417,7 +2432,7 @@ fn build_ui(app: &Application) {
                 } else {
                     ui.recent_stations.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.recent_stations.clone(), ui.last_update_timestamp.clone()));
+                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.recent_stations.clone(), ui.last_update_timestamp.clone(), false));
             }
         }
         sort_ascending.set(!asc);
@@ -2436,7 +2451,7 @@ fn build_ui(app: &Application) {
             list_box_votes.remove(&child);
         }
         browsing_votes.set_text("Loading stations...");
-        fetch_data_async(target_url, true, ViewType::Stations, prefs_votes.clone(), tx_votes.clone());
+        fetch_data_async(target_url, true, ViewType::Stations, prefs_votes.clone(), tx_votes.clone(), false);
     });
 
     let ui_fav_menu = ui_state.clone();
@@ -2574,7 +2589,7 @@ fn build_ui(app: &Application) {
             view.playlists.clone()
         };
         drop(view);
-        let _ = tx_pl.send_blocking(IncomingData::Stations(stations, String::new()));
+        let _ = tx_pl.send_blocking(IncomingData::Stations(stations, String::new(), false));
     });
 
     let ui_imp = ui_state.clone();
@@ -2698,7 +2713,7 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::None);
             drop(ui);
             br_btn_for_any.set_label("⊟ Bitrate");
-            let _ = tx_any.send_blocking(IncomingData::Stations(filtered, String::new()));
+            let _ = tx_any.send_blocking(IncomingData::Stations(filtered, String::new(), false));
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2710,7 +2725,7 @@ fn build_ui(app: &Application) {
             list_box_br.remove(&child);
         }
         browsing_br.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_any.clone(), tx_any.clone());
+        fetch_data_async(url, true, ViewType::Stations, prefs_any.clone(), tx_any.clone(), false);
     });
 
     let list_box_low = list_box.clone();
@@ -2731,7 +2746,7 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::Low);
             drop(ui);
             br_btn_for_low.set_label("⊟ Low ≤160");
-            let _ = tx_low.send_blocking(IncomingData::Stations(filtered, String::new()));
+            let _ = tx_low.send_blocking(IncomingData::Stations(filtered, String::new(), false));
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2743,7 +2758,7 @@ fn build_ui(app: &Application) {
             list_box_low.remove(&child);
         }
         browsing_low.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_low.clone(), tx_low.clone());
+        fetch_data_async(url, true, ViewType::Stations, prefs_low.clone(), tx_low.clone(), false);
     });
 
     let list_box_high = list_box.clone();
@@ -2764,7 +2779,7 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::High);
             drop(ui);
             br_btn_for_high.set_label("⊟ High ≥192");
-            let _ = tx_high.send_blocking(IncomingData::Stations(filtered, String::new()));
+            let _ = tx_high.send_blocking(IncomingData::Stations(filtered, String::new(), false));
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2776,7 +2791,7 @@ fn build_ui(app: &Application) {
             list_box_high.remove(&child);
         }
         browsing_high.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_high.clone(), tx_high.clone());
+        fetch_data_async(url, true, ViewType::Stations, prefs_high.clone(), tx_high.clone(), false);
     });
 
     let list_box_flac = list_box.clone();
@@ -2797,7 +2812,7 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::Flac);
             drop(ui);
             br_btn_for_flac.set_label("⊟ FLAC");
-            let _ = tx_flac.send_blocking(IncomingData::Stations(filtered, String::new()));
+            let _ = tx_flac.send_blocking(IncomingData::Stations(filtered, String::new(), false));
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2809,7 +2824,7 @@ fn build_ui(app: &Application) {
             list_box_flac.remove(&child);
         }
         browsing_flac.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_flac.clone(), tx_flac.clone());
+        fetch_data_async(url, true, ViewType::Stations, prefs_flac.clone(), tx_flac.clone(), false);
     });
 
     let state_row_click = player_state.clone();
@@ -2850,7 +2865,7 @@ fn build_ui(app: &Application) {
                     list_box_loading.remove(&child);
                 }
                 browsing_lbl_loading.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone());
+                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone(), false);
             }
             ViewType::Languages => {
                 let name = ui.categories[index].name.clone();
@@ -2864,7 +2879,7 @@ fn build_ui(app: &Application) {
                     list_box_loading.remove(&child);
                 }
                 browsing_lbl_loading.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone());
+                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone(), false);
             }
             ViewType::Countries => {
                 let name = ui.categories[index].name.clone();
@@ -2878,7 +2893,7 @@ fn build_ui(app: &Application) {
                     list_box_loading.remove(&child);
                 }
                 browsing_lbl_loading.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone());
+                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone(), false);
             }
         }
     });
@@ -3058,11 +3073,19 @@ fn build_ui(app: &Application) {
     let import_btn_rx = import_btn_clone.clone();
     let clear_recents_rx = clear_recents_btn.clone();
     let br_area_rx = br_area.clone();
+    let sw_restore = scrolled_window.clone();
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(data) = rx.recv().await {
-            while let Some(child) = list_box_clone.first_child() {
-                list_box_clone.remove(&child);
+            let is_load_more = matches!(&data, IncomingData::Stations(_, _, true));
+            // For load-more keep the list intact (spinner stays visible) — idle_add_local
+            // will wipe it on its first tick, replacing the spinner with real rows.
+            // For all other navigations clear immediately and reset scroll.
+            if !is_load_more {
+                while let Some(child) = list_box_clone.first_child() {
+                    list_box_clone.remove(&child);
+                }
+                sw_restore.vadjustment().set_value(0.0);
             }
 
             match data {
@@ -3207,7 +3230,7 @@ fn build_ui(app: &Application) {
                                         list_box_custom.remove(&child);
                                     }
                                     browsing_custom.set_text("Loading stations...");
-                                    fetch_data_async(url, true, ViewType::CustomTag(tc_rb.clone()), prefs_rb.clone(), txc_rb.clone());
+                                    fetch_data_async(url, true, ViewType::CustomTag(tc_rb.clone()), prefs_rb.clone(), txc_rb.clone(), false);
                                 });
                                 let row_box_rb = Box::builder().orientation(Orientation::Horizontal).spacing(0).hexpand(true).build();
                                 let rm_tag_rb = _tag_rb.clone();
@@ -3244,7 +3267,7 @@ fn build_ui(app: &Application) {
                         list_box_clone.append(&row);
                     }
                 }
-                IncomingData::Stations(stations_list, server_sync_time) => {
+                IncomingData::Stations(stations_list, server_sync_time, is_load_more) => {
                     clear_recents_rx.set_visible(false);
                     stations_count_label_clone.set_text("Updating stations...");
                     let mut ui = ui_rx.lock().unwrap();
@@ -3265,7 +3288,9 @@ fn build_ui(app: &Application) {
                     }
                     ui.stations = stations_list.clone();
                     ui.categories.clear();
-                    ui.current_index = None;
+                    if !is_load_more {
+                        ui.current_index = None;
+                    }
                     let working_count = stations_list.iter().filter(|s| s.lastcheckok == 1).count();
                     ui.total_elements_fetched = working_count;
                     ui.last_stations_updated_count = working_count;
@@ -3329,7 +3354,26 @@ fn build_ui(app: &Application) {
                     let count_label = stations_count_label_clone.clone();
                     let count_text = format!("{} stations displayed", total_stations);
                     let flat_css = vec!["flat".to_string()];
+                    let tx_load_more = tx_categories.clone();
+                    let prefs_load_more = app_prefs_categories.clone();
+                    let ui_load_more = ui_rx.clone();
+                    let has_more = total_stations >= station_limit().load(Ordering::Relaxed);
+                    let sw_batch = sw_restore.clone();
+                    let expected_gen = RENDER_GEN.fetch_add(1, Ordering::Relaxed) + 1;
                     glib::idle_add_local(move || {
+                        if RENDER_GEN.load(Ordering::Relaxed) != expected_gen {
+                            SCROLL_TO_ROW.store(usize::MAX, Ordering::Relaxed);
+                            return glib::ControlFlow::Break;
+                        }
+                        // On load-more: wipe the spinner row on the very first tick,
+                        // right before appending the first real rows. This keeps the
+                        // spinner visible during the network wait and replaces it
+                        // atomically with rendered content.
+                        if is_load_more && current_idx.get() == 0 {
+                            while let Some(child) = list_box_batch.first_child() {
+                                list_box_batch.remove(&child);
+                            }
+                        }
                         let max = display_rc.len();
                         for _ in 0..10 {
                             let idx = current_idx.get();
@@ -3338,6 +3382,69 @@ fn build_ui(app: &Application) {
                                     browsing_label.set_text(text);
                                 }
                                 count_label.set_text(&count_text);
+                                if has_more {
+                                    let load_btn = ActionRow::builder()
+                                        .title("Load More Stations")
+                                        .subtitle("Load 50 more stations")
+                                        .activatable(true)
+                                        .build();
+                                    let icon = gtk::Image::from_icon_name("go-down-symbolic");
+                                    icon.set_valign(gtk::Align::Center);
+                                    load_btn.add_prefix(&icon);
+                                    let tx_lm = tx_load_more.clone();
+                                    let prefs_lm = prefs_load_more.clone();
+                                    let ui_lm = ui_load_more.clone();
+                                    let lb_lm = list_box_batch.clone();
+                                    load_btn.connect_activated(move |_| {
+                                        while let Some(child) = lb_lm.first_child() {
+                                            lb_lm.remove(&child);
+                                        }
+                                        let loading_row = ActionRow::builder()
+                                            .title("Loading more stations...")
+                                            .activatable(false)
+                                            .build();
+                                        let spinner = gtk::Spinner::builder()
+                                            .valign(gtk::Align::Center)
+                                            .build();
+                                        spinner.set_size_request(16, 16);
+                                        spinner.start();
+                                        loading_row.add_suffix(&spinner);
+                                        lb_lm.append(&loading_row);
+                                        let old_limit = station_limit().load(Ordering::Relaxed);
+                                        SCROLL_TO_ROW.store(old_limit, Ordering::Relaxed);
+                                        let new_limit = old_limit + 50;
+                                        station_limit().store(new_limit, Ordering::Relaxed);
+                                        let ui = ui_lm.lock().unwrap();
+                                        let mut url = ui.last_fetched_url.clone();
+                                        let view = ui.current_view.clone();
+                                        drop(ui);
+                                        let sep = if url.contains('?') { "&" } else { "?" };
+                                        url.push_str(&format!("{}limit={}", sep, new_limit));
+                                        fetch_data_async(url, true, view, prefs_lm.clone(), tx_lm.clone(), true);
+                                    });
+                                    list_box_batch.append(&load_btn);
+                                }
+                                let scroll_idx = SCROLL_TO_ROW.swap(usize::MAX, Ordering::Relaxed);
+                                if scroll_idx != usize::MAX && scroll_idx < display_rc.len() {
+                                    let lb_scroll = list_box_batch.clone();
+                                    let sw_scroll = sw_batch.clone();
+                                    let retries = std::cell::Cell::new(0);
+                                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                                        if let Some(row) = lb_scroll.row_at_index(scroll_idx as i32) {
+                                            let y = row.allocation().y() as f64;
+                                            if y > 0.0 {
+                                                sw_scroll.vadjustment().set_value(y);
+                                                return glib::ControlFlow::Break;
+                                            }
+                                        }
+                                        retries.set(retries.get() + 1);
+                                        if retries.get() < 10 {
+                                            glib::ControlFlow::Continue
+                                        } else {
+                                            glib::ControlFlow::Break
+                                        }
+                                    });
+                                }
                                 return glib::ControlFlow::Break;
                             }
                             let data = &display_rc[idx];
@@ -3409,7 +3516,7 @@ fn build_ui(app: &Application) {
     let tx_init = tx.clone();
     let prefs_init = app_prefs.clone();
     let target_url = "https://de1.api.radio-browser.info/json/tags?order=stationcount&reverse=true&hidebroken=true".to_string();
-    fetch_data_async(target_url, false, ViewType::Tags, prefs_init, tx_init);
+    fetch_data_async(target_url, false, ViewType::Tags, prefs_init, tx_init, false);
 
     let ui_cron_tracker = ui_state.clone();
     let prefs_cron_tracker = app_prefs.clone();
@@ -3423,7 +3530,7 @@ fn build_ui(app: &Application) {
                 let is_stations = !matches!(view,
                     ViewType::Tags | ViewType::Languages | ViewType::Countries
                 );
-                fetch_data_async(current_url, is_stations, view, prefs_cron_tracker.clone(), tx_cron_tracker.clone());
+                fetch_data_async(current_url, is_stations, view, prefs_cron_tracker.clone(), tx_cron_tracker.clone(), false);
             }
             std::thread::sleep(Duration::from_secs(21600));
         }

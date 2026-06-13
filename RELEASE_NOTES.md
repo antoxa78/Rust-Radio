@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.3.0
+
+### New Features
+- **"Load More Stations" button**: Station lists now display a "Load More Stations" button at the bottom, fetching 50 additional stations per click — no more hard 250-station cap
+- **Real-time station count**: Counter shows the actual total number of stations loaded rather than a fixed limit
+- **Scroll position restored after loading more**: The view automatically scrolls back to the first newly loaded station after "Load More"
+
+### UX Improvements
+- **"Updating stations..." message** shown during station fetch so the UI never appears frozen
+- **Faster sync**: DNS host resolution is cached after the first lookup, reducing subsequent fetch delays
+- **App logo in About dialog**: The application icon now appears in the About dialog
+
+### Bug Fixes
+- **Station count persistence**: The working station count now persists correctly across preference window opens
+- **Live stats update**: "Total Working Stations Loaded" counter updates in real time instead of staying at 0 until the next window open
+
 ## v1.2.0
 
 ### Improvements
