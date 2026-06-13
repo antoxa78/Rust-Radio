@@ -6,9 +6,15 @@ use dns_lookup::lookup_addr;
 use adw::{ActionRow, ApplicationWindow, HeaderBar, PreferencesGroup, PreferencesPage, ComboRow};
 use gtk::{Application, Box, Button, DrawingArea, Label, ListBox, MenuButton, Orientation, Paned, Popover, Scale, ScrolledWindow, SearchEntry, Switch, StringList};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::collections::HashSet;
 use std::time::Duration;
+
+fn make_stats_label() -> Rc<RefCell<Option<gtk::Label>>> {
+    Rc::new(RefCell::new(None))
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct Station {
@@ -647,7 +653,14 @@ enum IncomingData {
 /// Resolve `all.api.radio-browser.info` via DNS, reverse-lookup each IP to
 /// get the actual server hostname, and return a randomly chosen one.
 /// Falls back to `de1.api.radio-browser.info` on any error.
+/// The result is cached after the first successful resolution.
 async fn resolve_radio_browser_host() -> String {
+    static CACHED_HOST: OnceLock<String> = OnceLock::new();
+
+    if let Some(host) = CACHED_HOST.get() {
+        return host.clone();
+    }
+
     use std::net::ToSocketAddrs;
 
     let ips = tokio::task::spawn_blocking(|| {
@@ -699,6 +712,7 @@ async fn resolve_radio_browser_host() -> String {
         .subsec_nanos()
         .hash(&mut h);
     let chosen = names[(h.finish() as usize) % names.len()].clone();
+    let _ = CACHED_HOST.set(chosen.clone());
     #[cfg(debug_assertions)]
     eprintln!("🌐 Radio-Browser DNS: discovered {:?}, using {}", names, chosen);
     chosen
@@ -1546,6 +1560,9 @@ fn build_ui(app: &Application) {
     let prefs_restore_ref = app_prefs.clone();
     let app_state_restore_ref = app_state_manager.clone();
     let app_state_prefs_close_ref = app_state_manager.clone();
+    let stats_label_holder = make_stats_label();
+    let stats_label_btn = stats_label_holder.clone();
+    let stats_label_chan = stats_label_holder.clone();
 
     settings_btn.connect_clicked(move |_| {
         menu_popover.popdown();
@@ -1561,13 +1578,20 @@ fn build_ui(app: &Application) {
 
         let stats_group = PreferencesGroup::builder()
             .title("Database Statistics &amp; Cache Lifecycle Telemetry")
-            .description(&format!(
+            .build();
+        let stats_display = Label::builder()
+            .label(&format!(
                 "Total Working Stations Loaded: {}\nLast Radio-Browser Sync: {}\nTotal Categories / Stations Fetched: {}",
                 current_ui.last_stations_updated_count,
                 current_ui.last_update_timestamp,
                 current_ui.total_elements_fetched
             ))
+            .css_classes(vec!["caption".to_string()])
+            .halign(gtk::Align::Start)
+            .wrap(true)
             .build();
+        stats_group.add(&stats_display);
+        *stats_label_btn.borrow_mut() = Some(stats_display.clone());
 
         let sync_row = ActionRow::builder().title("Update Station List Now").build();
         let sync_btn = Button::builder()
@@ -1693,7 +1717,7 @@ fn build_ui(app: &Application) {
                 .transient_for(&parent_window)
                 .modal(true)
                 .default_width(420)
-                .default_height(280)
+                .default_height(360)
                 .resizable(false)
                 .build();
             let content = Box::builder()
@@ -1701,6 +1725,15 @@ fn build_ui(app: &Application) {
                 .spacing(12)
                 .margin_top(24).margin_bottom(24).margin_start(24).margin_end(24)
                 .build();
+            let logo = gtk::Picture::builder()
+                .width_request(128)
+                .height_request(128)
+                .halign(gtk::Align::Center)
+                .valign(gtk::Align::Center)
+                .keep_aspect_ratio(true)
+                .can_shrink(true)
+                .build();
+            logo.set_filename(Some("assets/icon-256.png"));
             let app_label = Label::builder()
                 .label(&format!("Rust Radio v{}", env!("CARGO_PKG_VERSION")))
                 .css_classes(vec!["title-1".to_string()])
@@ -1734,6 +1767,7 @@ fn build_ui(app: &Application) {
                 .css_classes(vec!["caption".to_string()])
                 .halign(gtk::Align::Center)
                 .build();
+            content.append(&logo);
             content.append(&app_label);
             content.append(&desc_label);
             content.append(&build_label);
@@ -3054,6 +3088,14 @@ fn build_ui(app: &Application) {
                     now_browsing_label_clone.set_text(browsing_text);
                     ui.last_update_timestamp = time_string;
                     ui.total_elements_fetched = items.len();
+                    if let Some(ref lbl) = *stats_label_chan.borrow() {
+                        lbl.set_text(&format!(
+                            "Total Working Stations Loaded: {}\nLast Radio-Browser Sync: {}\nTotal Categories / Stations Fetched: {}",
+                            ui.last_stations_updated_count,
+                            ui.last_update_timestamp,
+                            ui.total_elements_fetched,
+                        ));
+                    }
                     match ui.current_view {
                         ViewType::Tags => ui.cached_tags = Some(items.clone()),
                         ViewType::Languages => ui.cached_languages = Some(items.clone()),
@@ -3223,6 +3265,14 @@ fn build_ui(app: &Application) {
                     let working_count = stations_list.iter().filter(|s| s.lastcheckok == 1).count();
                     ui.total_elements_fetched = working_count;
                     ui.last_stations_updated_count = working_count;
+                    if let Some(ref lbl) = *stats_label_chan.borrow() {
+                        lbl.set_text(&format!(
+                            "Total Working Stations Loaded: {}\nLast Radio-Browser Sync: {}\nTotal Categories / Stations Fetched: {}",
+                            ui.last_stations_updated_count,
+                            ui.last_update_timestamp,
+                            ui.total_elements_fetched,
+                        ));
+                    }
 
                     let browsing_text = match &ui.current_view {
                         ViewType::CustomTag(t) => Some(format!("Now Browsing Custom Tags > {}", t)),

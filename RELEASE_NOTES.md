@@ -4,6 +4,9 @@
 
 ### Improvements
 - **Stable stream title during buffering**: Station title no longer jumps while buffering — buffering progress is now shown appended to the stream properties line (e.g. `MP3 · 128 kbps · ⏳ 42%`)
+- **Live stats in preferences**: "Total Working Stations Loaded" counter now updates dynamically instead of staying at 0 until the next window open
+- **Faster sync**: DNS host resolution is cached after the first lookup, reducing subsequent fetch delays
+- **App logo in About dialog**: The application icon now appears in the About dialog
 
 ## v1.1.0
 
