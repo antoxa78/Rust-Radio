@@ -1,5 +1,10 @@
 # Release Notes
 
+## v1.2.0
+
+### Improvements
+- **Stable stream title during buffering**: Station title no longer jumps while buffering — buffering progress is now shown appended to the stream properties line (e.g. `MP3 · 128 kbps · ⏳ 42%`)
+
 ## v1.1.0
 
 ### New Features

@@ -2,3 +2,5 @@ target/
 Untitled.png
 ok/
 *.pyc
+*.tar.gz
+dns

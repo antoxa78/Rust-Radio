@@ -2,6 +2,7 @@ use adw::prelude::*;
 use gtk::prelude::Cast;
 use gstreamer::prelude::*;
 use gstreamer::prelude::ObjectExt as GstObjectExt;
+use dns_lookup::lookup_addr;
 use adw::{ActionRow, ApplicationWindow, HeaderBar, PreferencesGroup, PreferencesPage, ComboRow};
 use gtk::{Application, Box, Button, DrawingArea, Label, ListBox, MenuButton, Orientation, Paned, Popover, Scale, ScrolledWindow, SearchEntry, Switch, StringList};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,7 @@ struct AudioMetadata {
     stream_title: Option<String>,
     codec: Option<String>,
     bit_depth: Option<i32>,
+    buffering_percent: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -66,6 +68,7 @@ struct AppPreferences {
     audio_sink: String,
     disable_video_streams: bool,
     disable_audio_buffer: bool,
+    volume: f64,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -136,6 +139,8 @@ fn default_disable_audio_buffer() -> bool { false }
 
 fn default_analyzer_type() -> String { "BlocksWithHold".to_string() }
 
+fn default_volume() -> f64 { 1.0 }
+
 #[derive(Serialize, Deserialize, Default)]
 struct SavedData {
     favorites: Vec<Station>,
@@ -156,6 +161,8 @@ struct SavedData {
     disable_audio_buffer: bool,
     #[serde(default = "default_analyzer_type")]
     analyzer_type: String,
+    #[serde(default = "default_volume")]
+    volume: f64,
 }
 
 struct AppState {
@@ -187,6 +194,7 @@ impl AppState {
         let audio_sink = prefs.audio_sink.clone();
         let disable_video_streams = prefs.disable_video_streams;
         let disable_audio_buffer = prefs.disable_audio_buffer;
+        let volume = prefs.volume;
         let analyzer_type = match prefs.analyzer_type {
             AnalyzerType::Bars => "Bars",
             AnalyzerType::Wave => "Wave",
@@ -206,6 +214,7 @@ impl AppState {
             disable_video_streams,
             disable_audio_buffer,
             analyzer_type,
+            volume,
         };
 
         if let Ok(json) = serde_json::to_string(&data) {
@@ -229,7 +238,7 @@ fn main() {
     gstreamer::init().expect("Failed to initialize GStreamer.");
     
     let application = Application::builder()
-        .application_id("com.example.RustRadioGtk")
+        .application_id("io.github.antoxa78.RustRadio")
         .build();
 
     application.connect_activate(build_ui);
@@ -247,10 +256,12 @@ fn calculate_adaptive_buffer(bitrate_kbps: Option<u32>) -> i64 {
                 193..=320 => 10,     // High bitrate (256-320 kbps): 10 seconds
                 _ => 8,              // Very high bitrate (>320 kbps): 8 seconds
             };
+            #[cfg(debug_assertions)]
             eprintln!("📊 Adaptive Buffer: {} kbps → {} seconds buffer", bitrate, duration_seconds);
             duration_seconds * 1_000_000_000i64  // Convert to nanoseconds
         }
         None => {
+            #[cfg(debug_assertions)]
             eprintln!("📊 Adaptive Buffer: Unknown bitrate → 10 seconds buffer (default)");
             10_000_000_000i64  // Default 10 seconds
         }
@@ -303,7 +314,14 @@ fn play_station(
     };
     
     // Track recently played (keep last 50, no duplicates)
-    ui.recent_stations.retain(|s| s.stationuuid != station.stationuuid);
+    // For imported stations (empty UUID), deduplicate by URL instead
+    ui.recent_stations.retain(|s| {
+        if s.stationuuid.is_empty() {
+            s.url_resolved != station.url_resolved
+        } else {
+            s.stationuuid != station.stationuuid
+        }
+    });
     ui.recent_stations.insert(0, station.clone());
     ui.recent_stations.truncate(50);
     
@@ -334,6 +352,7 @@ fn play_station(
         meta.stream_title = None;
         meta.codec = None;
         meta.bit_depth = None;
+        meta.buffering_percent = None;
     }
     stream_meta_label.set_text("(Connecting...)");
     stream_info_label.set_text("");
@@ -356,13 +375,13 @@ fn play_station(
         None
     };
 
-        let disable_buffer = prefs.lock().unwrap().disable_audio_buffer;
-        let buffer_duration = if disable_buffer {
-            0
-        } else {
-            calculate_adaptive_buffer(station.bitrate)
-        };
-        let mut playbin_builder = gstreamer::ElementFactory::make("playbin")
+    let disable_buffer = prefs.lock().unwrap().disable_audio_buffer;
+    let buffer_duration: i64 = if disable_buffer {
+        -1  // -1 = use GStreamer's default (no forced pre-buffering)
+    } else {
+        calculate_adaptive_buffer(station.bitrate)
+    };
+    let mut playbin_builder = gstreamer::ElementFactory::make("playbin")
         .property("uri", &url)
         .property("buffer-duration", buffer_duration);  // Adaptive buffer based on bitrate
     if let Some(ref sink) = audio_sink {
@@ -377,6 +396,10 @@ fn play_station(
      if let Ok(pipeline) = playbin_builder.build()
     {
         let buffer_disabled = prefs.lock().unwrap().disable_audio_buffer;
+
+        // Apply saved volume immediately
+        let saved_vol = prefs.lock().unwrap().volume;
+        pipeline.set_property("volume", saved_vol);
 
         // Start in PAUSED state for prebuffering, or PLAYING if buffer is disabled
         let _ = pipeline.set_state(if buffer_disabled { gstreamer::State::Playing } else { gstreamer::State::Paused });
@@ -401,18 +424,24 @@ fn play_station(
             match msg.view() {
                 gstreamer::MessageView::Buffering(buffering_msg) => {
                     let percent = buffering_msg.percent();
+                    #[cfg(debug_assertions)]
                     eprintln!("Buffering: {}%", percent);
                     
                     if buffer_disabled {
                         return glib::ControlFlow::Continue;
                     }
                     
-                    // Display buffering progress in the label
-                    label_rc.set_text(&format!("⏳ Buffering: {}%", percent));
+                    {
+                        let mut meta = meta_rc.lock().unwrap();
+                        meta.buffering_percent = Some(percent as u32);
+                    }
                     
                     // When buffering reaches 100%, start playback
                     if percent == 100 {
-                        label_rc.set_text("♫ Live Stream");
+                        {
+                            let mut meta = meta_rc.lock().unwrap();
+                            meta.buffering_percent = None;
+                        }
                         if let Ok(pipeline) = pipeline_for_buffering.lock() {
                             let _ = pipeline.set_state(gstreamer::State::Playing);
                         }
@@ -429,6 +458,7 @@ fn play_station(
                     }
                     if let Some(bitrate) = tags.index::<gstreamer::tags::Bitrate>(0) {
                         meta.bitrate = Some(bitrate.get());
+                        #[cfg(debug_assertions)]
                         eprintln!("🎵 Stream Bitrate Detected: {} kbps", bitrate.get());
                     }
                     if meta.codec.is_none() {
@@ -441,6 +471,7 @@ fn play_station(
                     label_rc.set_text(&format!("♫ {}", title_str));
                 }
                 gstreamer::MessageView::Error(err) => {
+                    #[cfg(debug_assertions)]
                     eprintln!("Playback Error encountered: {}. Attempting fallback track...", err.error());
                     
                     let next_index = {
@@ -487,6 +518,7 @@ fn play_station(
         player.bus_guard = Some(guard);
         player.pipeline = Some(pipeline);
     } else {
+        #[cfg(debug_assertions)]
         eprintln!("Failed to create pipeline for {}, skipping...", url);
         drop(player);
         let next_index = index + 1;
@@ -612,6 +644,72 @@ enum IncomingData {
     Stations(Vec<Station>, String),   // String = server DB last-change time from radio-browser.info
 }
 
+/// Resolve `all.api.radio-browser.info` via DNS, reverse-lookup each IP to
+/// get the actual server hostname, and return a randomly chosen one.
+/// Falls back to `de1.api.radio-browser.info` on any error.
+async fn resolve_radio_browser_host() -> String {
+    use std::net::ToSocketAddrs;
+
+    let ips = tokio::task::spawn_blocking(|| {
+        ("all.api.radio-browser.info", 443u16)
+            .to_socket_addrs()
+            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
+    })
+    .await;
+
+    let ips = match ips {
+        Ok(Ok(v)) if !v.is_empty() => v,
+        _ => {
+            #[cfg(debug_assertions)]
+            eprintln!("🌐 Radio-Browser DNS: forward lookup failed, using de1 fallback");
+            return "de1.api.radio-browser.info".to_string();
+        }
+    };
+
+    // Reverse-lookup each IP in parallel to get the named hostname.
+    let mut names: Vec<String> = Vec::new();
+    for ip in &ips {
+        let ip = *ip;
+        if let Ok(Ok(hostname)) = tokio::task::spawn_blocking(move || {
+            lookup_addr(&ip)
+        })
+        .await
+        {
+            let host = hostname.trim_end_matches('.').to_string();
+            if host.ends_with(".api.radio-browser.info") && !names.contains(&host) {
+                names.push(host);
+            }
+        }
+    }
+
+    if names.is_empty() {
+        #[cfg(debug_assertions)]
+        eprintln!("🌐 Radio-Browser DNS: reverse lookup returned no valid names, using de1 fallback");
+        return "de1.api.radio-browser.info".to_string();
+    }
+
+    // Pick a server randomly using the current time as a seed.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::SystemTime;
+    let mut h = DefaultHasher::new();
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
+        .hash(&mut h);
+    let chosen = names[(h.finish() as usize) % names.len()].clone();
+    #[cfg(debug_assertions)]
+    eprintln!("🌐 Radio-Browser DNS: discovered {:?}, using {}", names, chosen);
+    chosen
+}
+
+/// Replace the `de1.api.radio-browser.info` placeholder in a URL with the
+/// discovered host.  Safe to call even when the URL was already rewritten.
+fn with_host(url: &str, host: &str) -> String {
+    url.replace("de1.api.radio-browser.info", host)
+}
+
 fn fetch_data_async(
     mut url: String,
     is_stations: bool,
@@ -622,6 +720,10 @@ fn fetch_data_async(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            // Discover the best available server via DNS before building URLs.
+            let host = resolve_radio_browser_host().await;
+            url = with_host(&url, &host);
+
             let config = prefs.lock().unwrap();
 
             if is_stations {
@@ -637,11 +739,10 @@ fn fetch_data_async(
 
             let client = reqwest::Client::new();
             if is_stations {
+                let stats_url = format!("https://{}/json/stats", host);
                 let (stations_fut, stats_fut) = tokio::join!(
                     client.get(&url).header("User-Agent", "RustRadio/1.0").send(),
-                    client.get("https://de1.api.radio-browser.info/json/stats")
-                        .header("User-Agent", "RustRadio/1.0")
-                        .send(),
+                    client.get(&stats_url).header("User-Agent", "RustRadio/1.0").send(),
                 );
                 if let Ok(response) = stations_fut {
                     if let Ok(stations) = response.json::<Vec<Station>>().await {
@@ -861,7 +962,7 @@ fn build_ui(app: &Application) {
     // --- REHYDRATE FROM DISK ---
     let saved_data = AppState::load_data();
 
-    let current_metadata = Arc::new(Mutex::new(AudioMetadata { bitrate: None, sample_rate: None, stream_title: None, codec: None, bit_depth: None }));
+    let current_metadata = Arc::new(Mutex::new(AudioMetadata { bitrate: None, sample_rate: None, stream_title: None, codec: None, bit_depth: None, buffering_percent: None }));
     let player_state = Arc::new(Mutex::new(PlayerState { pipeline: None, bus_guard: None, is_paused: false, current_metadata, currently_playing_station: None }));
     
     let app_prefs = Arc::new(Mutex::new(AppPreferences { 
@@ -878,6 +979,7 @@ fn build_ui(app: &Application) {
         audio_sink: saved_data.audio_sink,
         disable_video_streams: saved_data.disable_video_streams,
         disable_audio_buffer: saved_data.disable_audio_buffer,
+        volume: saved_data.volume,
     }));
     
     let last_sync_ts = if saved_data.last_sync_timestamp.is_empty() {
@@ -1393,7 +1495,8 @@ fn build_ui(app: &Application) {
         .valign(gtk::Align::Center)
         .draw_value(false)
         .build();
-    volume_scale.set_value(1.0);
+    let saved_volume = app_prefs.lock().unwrap().volume;
+    volume_scale.set_value(saved_volume);
 
     let centre_controls = Box::builder()
         .orientation(Orientation::Horizontal)
@@ -1441,7 +1544,6 @@ fn build_ui(app: &Application) {
     let prefs_backup_ref = app_prefs.clone();
     let ui_restore_ref = ui_state.clone();
     let prefs_restore_ref = app_prefs.clone();
-    let _app_state_backup_ref = app_state_manager.clone();
     let app_state_restore_ref = app_state_manager.clone();
     let app_state_prefs_close_ref = app_state_manager.clone();
 
@@ -1460,7 +1562,7 @@ fn build_ui(app: &Application) {
         let stats_group = PreferencesGroup::builder()
             .title("Database Statistics &amp; Cache Lifecycle Telemetry")
             .description(&format!(
-                "Total Stations Loaded: {}\nLast Radio-Browser Sync: {}\nActive Buffer Payload Allocation: {} index maps stored.",
+                "Total Working Stations Loaded: {}\nLast Radio-Browser Sync: {}\nTotal Categories / Stations Fetched: {}",
                 current_ui.last_stations_updated_count,
                 current_ui.last_update_timestamp,
                 current_ui.total_elements_fetched
@@ -2885,12 +2987,15 @@ fn build_ui(app: &Application) {
     });
 
     let player_vol = player_state.clone();
+    let prefs_vol = app_prefs.clone();
     volume_scale.connect_value_changed(move |scale| {
         let vol = scale.value();
         let player = player_vol.lock().unwrap();
         if let Some(pipeline) = &player.pipeline {
             pipeline.set_property("volume", vol);
         }
+        drop(player);
+        prefs_vol.lock().unwrap().volume = vol;
         // Update icon based on level
         let icon = if vol == 0.0 {
             "audio-volume-muted-symbolic"
@@ -3224,15 +3329,10 @@ fn build_ui(app: &Application) {
                                 let station_name = data.station.name.clone();
                                 rm_btn.connect_clicked(move |_| {
                                     let mut v = ui_for_rm.lock().unwrap();
-                                    let key = if station_uuid.is_empty() {
-                                        (station_url.clone(), station_name.clone())
+                                    let pos = if station_uuid.is_empty() {
+                                        v.playlists.iter().position(|p| p.url_resolved == station_url && p.name == station_name)
                                     } else {
-                                        (station_uuid.clone(), String::new())
-                                    };
-                                    let pos = if key.0 == station_uuid {
-                                        v.playlists.iter().position(|p| p.stationuuid == key.0)
-                                    } else {
-                                        v.playlists.iter().position(|p| p.url_resolved == key.0 && p.name == key.1)
+                                        v.playlists.iter().position(|p| p.stationuuid == station_uuid)
                                     };
                                     if let Some(idx) = pos {
                                         v.playlists.remove(idx);
@@ -3349,37 +3449,45 @@ fn build_ui(app: &Application) {
                                         _ => None,
                                     };
                                 }
-
-                                // Stream title line
-                                let title_str = meta.stream_title.clone()
-                                    .unwrap_or_else(|| "Live Stream".to_string());
-                                meta_label_hook.set_text(&format!("♫ {}", title_str));
-
-                                // Stream info line: codec · bitrate · sample rate · bit depth
-                                let mut parts: Vec<String> = Vec::new();
-                                if let Some(ref codec) = meta.codec {
-                                    parts.push(codec.clone());
-                                }
-                                if let Some(br) = meta.bitrate {
-                                    parts.push(format!("{} kbps", br / 1000));
-                                }
-                                if let Some(sr) = meta.sample_rate {
-                                    if sr >= 1000 {
-                                        parts.push(format!("{:.1} kHz", sr as f64 / 1000.0));
-                                    } else {
-                                        parts.push(format!("{} Hz", sr));
-                                    }
-                                }
-                                if let Some(bd) = meta.bit_depth {
-                                    parts.push(format!("{}-bit", bd));
-                                }
-                                if parts.is_empty() {
-                                    info_label_hook.set_text("");
-                                } else {
-                                    info_label_hook.set_text(&parts.join(" · "));
-                                }
                             }
                         }
+                    }
+                }
+
+                // Update labels with current metadata (including buffering status)
+                {
+                    let meta = state.current_metadata.lock().unwrap();
+
+                    // Stream title line
+                    let title_str = meta.stream_title.clone()
+                        .unwrap_or_else(|| "Live Stream".to_string());
+                    meta_label_hook.set_text(&format!("♫ {}", title_str));
+
+                    // Stream info line: codec · bitrate · sample rate · bit depth · buffering
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(ref codec) = meta.codec {
+                        parts.push(codec.clone());
+                    }
+                    if let Some(br) = meta.bitrate {
+                        parts.push(format!("{} kbps", br / 1000));
+                    }
+                    if let Some(sr) = meta.sample_rate {
+                        if sr >= 1000 {
+                            parts.push(format!("{:.1} kHz", sr as f64 / 1000.0));
+                        } else {
+                            parts.push(format!("{} Hz", sr));
+                        }
+                    }
+                    if let Some(bd) = meta.bit_depth {
+                        parts.push(format!("{}-bit", bd));
+                    }
+                    if let Some(pct) = meta.buffering_percent {
+                        parts.push(format!("⏳ {}%", pct));
+                    }
+                    if parts.is_empty() {
+                        info_label_hook.set_text("");
+                    } else {
+                        info_label_hook.set_text(&parts.join(" · "));
                     }
                 }
             } else {
