@@ -773,7 +773,7 @@ fn fetch_data_async(
                             Err(_) => "Unknown".to_string(),
                         };
                         let _ = tx.send_blocking(IncomingData::Stations(
-                            stations.into_iter().take(250).collect(),
+                            stations,
                             sync_time,
                         ));
                     }
