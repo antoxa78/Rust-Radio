@@ -3246,6 +3246,7 @@ fn build_ui(app: &Application) {
                 }
                 IncomingData::Stations(stations_list, server_sync_time) => {
                     clear_recents_rx.set_visible(false);
+                    stations_count_label_clone.set_text("Updating stations...");
                     let mut ui = ui_rx.lock().unwrap();
                     if !matches!(ui.current_view, ViewType::Playlists) {
                         import_btn_rx.set_visible(false);
