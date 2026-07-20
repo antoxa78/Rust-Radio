@@ -1,5 +1,29 @@
 # Release Notes
 
+## v1.3.1
+
+### Bug Fixes
+- **Play/pause no longer panics when a pipeline fails to create** — the currently-playing state is only set after the GStreamer pipeline builds successfully.
+- **Imported playlist stations are no longer treated as one favourite** — favourites now compare by UUID for API stations and by URL+name for imported stations.
+- **“Load More Stations” now actually fetches more stations** — duplicate `limit=` parameters are replaced instead of ignored.
+- **Search queries are URL-encoded** — searches with spaces or special characters now produce valid requests.
+- **Playlist remove button now removes the UI row** and updates the station count immediately.
+- **Auto-update no longer overwrites Favorites / Recent / Playlist views** — it only refreshes live station lists.
+- **Preferences mutex no longer held across async await points** — network fetches no longer block the UI thread on preferences.
+
+### Persistence
+- `prefer_high_bitrate`, `hide_broken`, and `auto_update` preferences are now saved and restored.
+- `Station::lastcheckok` now has a serde default for backward compatibility with older saved data.
+
+### Reliability & UX
+- Added shared Tokio runtime and HTTP client to avoid creating a new thread/runtime per request.
+- Failed network/category fetches now surface an error message instead of leaving the UI stuck on “Loading…”.
+- Back button now works correctly when navigating from Favorites, Recent, and Playlists.
+
+### Maintenance
+- Removed unused `directories` dependency.
+- Resolved all outstanding Clippy warnings.
+
 ## v1.3.0
 
 ### New Features

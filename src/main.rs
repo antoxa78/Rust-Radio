@@ -19,6 +19,8 @@ fn make_stats_label() -> Rc<RefCell<Option<gtk::Label>>> {
 
 static SCROLL_TO_ROW: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RENDER_GEN: AtomicUsize = AtomicUsize::new(0);
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static HTTP_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn station_limit() -> &'static AtomicUsize {
     static LIMIT: OnceLock<AtomicUsize> = OnceLock::new();
@@ -34,6 +36,7 @@ struct Station {
     country: String,
     #[serde(default)]
     countrycode: String,
+    #[serde(default)]
     lastcheckok: i32,
     bitrate: Option<u32>,
 }
@@ -43,6 +46,14 @@ struct StationDisplay {
     subtitle: String,
     station: Station,
     is_fav: bool,
+}
+
+fn station_eq(a: &Station, b: &Station) -> bool {
+    if !a.stationuuid.is_empty() && !b.stationuuid.is_empty() {
+        a.stationuuid == b.stationuuid
+    } else {
+        a.url_resolved == b.url_resolved && a.name == b.name
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -156,7 +167,13 @@ fn default_analyzer_type() -> String { "BlocksWithHold".to_string() }
 
 fn default_volume() -> f64 { 1.0 }
 
-#[derive(Serialize, Deserialize, Default)]
+fn default_prefer_high_bitrate() -> bool { true }
+
+fn default_hide_broken() -> bool { true }
+
+fn default_auto_update() -> bool { true }
+
+#[derive(Serialize, Deserialize)]
 struct SavedData {
     favorites: Vec<Station>,
     custom_tags: Vec<String>,
@@ -180,6 +197,34 @@ struct SavedData {
     volume: f64,
     #[serde(default)]
     last_stations_loaded: usize,
+    #[serde(default = "default_prefer_high_bitrate")]
+    prefer_high_bitrate: bool,
+    #[serde(default = "default_hide_broken")]
+    hide_broken: bool,
+    #[serde(default = "default_auto_update")]
+    auto_update: bool,
+}
+
+impl Default for SavedData {
+    fn default() -> Self {
+        Self {
+            favorites: Vec::new(),
+            custom_tags: Vec::new(),
+            active_bitrate: default_bitrate_str(),
+            recent_stations: Vec::new(),
+            last_sync_timestamp: String::new(),
+            playlists: Vec::new(),
+            audio_sink: default_audio_sink(),
+            disable_video_streams: default_disable_video_streams(),
+            disable_audio_buffer: default_disable_audio_buffer(),
+            analyzer_type: default_analyzer_type(),
+            volume: default_volume(),
+            last_stations_loaded: 0,
+            prefer_high_bitrate: default_prefer_high_bitrate(),
+            hide_broken: default_hide_broken(),
+            auto_update: default_auto_update(),
+        }
+    }
 }
 
 struct AppState {
@@ -213,6 +258,9 @@ impl AppState {
         let disable_video_streams = prefs.disable_video_streams;
         let disable_audio_buffer = prefs.disable_audio_buffer;
         let volume = prefs.volume;
+        let prefer_high_bitrate = prefs.prefer_high_bitrate;
+        let hide_broken = prefs.hide_broken;
+        let auto_update = prefs.auto_update;
         let analyzer_type = match prefs.analyzer_type {
             AnalyzerType::Bars => "Bars",
             AnalyzerType::Wave => "Wave",
@@ -234,6 +282,9 @@ impl AppState {
             analyzer_type,
             volume,
             last_stations_loaded,
+            prefer_high_bitrate,
+            hide_broken,
+            auto_update,
         };
 
         if let Ok(json) = serde_json::to_string(&data) {
@@ -287,6 +338,7 @@ fn calculate_adaptive_buffer(bitrate_kbps: Option<u32>) -> i64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn play_station(
     player_lock: &Arc<Mutex<PlayerState>>, 
     ui_lock: &Arc<Mutex<UIState>>,
@@ -344,7 +396,7 @@ fn play_station(
     ui.recent_stations.insert(0, station.clone());
     ui.recent_stations.truncate(50);
     
-    if ui.favorites.iter().any(|f| f.stationuuid == station.stationuuid) {
+    if ui.favorites.iter().any(|f| station_eq(f, &station)) {
         fav_toggle_btn.set_icon_name("starred-symbolic");
     } else {
         fav_toggle_btn.set_icon_name("non-starred-symbolic");
@@ -354,7 +406,6 @@ fn play_station(
 
     let mut player = player_lock.lock().unwrap();
     player.is_paused = false;
-    player.currently_playing_station = Some(station.clone());
     play_pause_btn.set_icon_name("media-playback-pause-symbolic");
 
     now_playing_title.set_text(&glib::markup_escape_text(&station.name));
@@ -489,9 +540,9 @@ fn play_station(
                     let title_str = meta.stream_title.clone().unwrap_or_else(|| "Live Stream".to_string());
                     label_rc.set_text(&format!("♫ {}", title_str));
                 }
-                gstreamer::MessageView::Error(err) => {
+                gstreamer::MessageView::Error(_err) => {
                     #[cfg(debug_assertions)]
-                    eprintln!("Playback Error encountered: {}. Attempting fallback track...", err.error());
+                    eprintln!("Playback Error encountered: {}. Attempting fallback track...", _err.error());
                     
                     let next_index = {
                         let ui = ui_fallback.lock().unwrap();
@@ -534,12 +585,16 @@ fn play_station(
             glib::ControlFlow::Continue
         }).expect("Failed to hook message bus loop watch context.");
 
+        player.currently_playing_station = Some(station.clone());
         player.bus_guard = Some(guard);
         player.pipeline = Some(pipeline);
     } else {
         #[cfg(debug_assertions)]
         eprintln!("Failed to create pipeline for {}, skipping...", url);
+        player.currently_playing_station = None;
+        player.is_paused = false;
         drop(player);
+        play_pause_btn.set_icon_name("media-playback-start-symbolic");
         let next_index = index + 1;
         let total = {
             let ui = ui_lock.lock().unwrap();
@@ -661,6 +716,7 @@ fn format_time(duration: Duration) -> String {
 enum IncomingData {
     Categories(ViewType, Vec<BrowseItem>),
     Stations(Vec<Station>, String, bool),   // String = server DB last-change time, bool = is_load_more
+    Error(String),
 }
 
 /// Resolve `all.api.radio-browser.info` via DNS, reverse-lookup each IP to
@@ -745,63 +801,109 @@ fn fetch_data_async(
     tx: async_channel::Sender<IncomingData>,
     is_load_more: bool,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            // Discover the best available server via DNS before building URLs.
-            let host = resolve_radio_browser_host().await;
-            url = with_host(&url, &host);
+    let client = HTTP_CLIENT.get_or_init(reqwest::Client::new).clone();
+    let rt = HTTP_RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+    rt.spawn(async move {
+        // Discover the best available server via DNS before building URLs.
+        let host = resolve_radio_browser_host().await;
+        url = with_host(&url, &host);
 
+        let (hide_broken, prefer_high_bitrate) = {
             let config = prefs.lock().unwrap();
+            (config.hide_broken, config.prefer_high_bitrate)
+        };
 
-            if is_stations {
-                let sep = |u: &str| if u.contains('?') { "&" } else { "?" };
-                if !url.contains("limit=") {
-                    station_limit().store(250, Ordering::Relaxed);
-                    url.push_str(&format!("{}limit=250", sep(&url)));
-                }
-                if config.hide_broken && !url.contains("lastcheckok=") {
-                    url.push_str(&format!("{}lastcheckok=1", sep(&url)));
-                }
-                if config.prefer_high_bitrate && !url.contains("order=") {
-                    url.push_str(&format!("{}order=bitrate&reverse=true", sep(&url)));
-                }
+        if is_stations {
+            let sep = |u: &str| if u.contains('?') { "&" } else { "?" };
+            if !url.contains("limit=") {
+                station_limit().store(250, Ordering::Relaxed);
             }
-            drop(config);
-
-            let client = reqwest::Client::new();
-            if is_stations {
-                let stats_url = format!("https://{}/json/stats", host);
-                let (stations_fut, stats_fut) = tokio::join!(
-                    client.get(&url).header("User-Agent", "RustRadio/1.0").send(),
-                    client.get(&stats_url).header("User-Agent", "RustRadio/1.0").send(),
-                );
-                if let Ok(response) = stations_fut {
-                    if let Ok(stations) = response.json::<Vec<Station>>().await {
-                        let sync_time = match stats_fut {
-                            Ok(resp) => resp
-                                .json::<RadioBrowserStats>()
-                                .await
-                                .map(|s| s.lastchangetime)
-                                .unwrap_or_else(|_| "Unknown".to_string()),
-                            Err(_) => "Unknown".to_string(),
-                        };
-                        let _ = tx.send_blocking(IncomingData::Stations(
-                            stations,
-                            sync_time,
-                            is_load_more,
-                        ));
-                    }
-                }
+            let target_limit = station_limit().load(Ordering::Relaxed);
+            if let Some(pos) = url.find("limit=") {
+                let start = pos + "limit=".len();
+                let end = url[start..].find(|c: char| !c.is_ascii_digit())
+                    .map(|i| start + i)
+                    .unwrap_or(url.len());
+                url.replace_range(start..end, &target_limit.to_string());
             } else {
-                if let Ok(response) = client.get(&url).header("User-Agent", "RustRadio/1.0").send().await {
-                    if let Ok(cats) = response.json::<Vec<BrowseItem>>().await {
-                        let filtered = cats.into_iter().filter(|c| !c.name.trim().is_empty()).take(100).collect();
-                        let _ = tx.send_blocking(IncomingData::Categories(target_view, filtered));
+                url.push_str(&format!("{}limit={}", sep(&url), target_limit));
+            }
+            if hide_broken && !url.contains("lastcheckok=") {
+                url.push_str(&format!("{}lastcheckok=1", sep(&url)));
+            }
+            if prefer_high_bitrate && !url.contains("order=") {
+                url.push_str(&format!("{}order=bitrate&reverse=true", sep(&url)));
+            }
+        }
+
+        let user_agent = "RustRadio/1.0";
+        if is_stations {
+            let stats_url = format!("https://{}/json/stats", host);
+            let (stations_result, stats_result) = tokio::join!(
+                client.get(&url).header("User-Agent", user_agent).send(),
+                client.get(&stats_url).header("User-Agent", user_agent).send(),
+            );
+            match stations_result {
+                Ok(response) => {
+                    match response.json::<Vec<Station>>().await {
+                        Ok(stations) => {
+                            let sync_time = match stats_result {
+                                Ok(resp) => resp
+                                    .json::<RadioBrowserStats>()
+                                    .await
+                                    .map(|s| s.lastchangetime)
+                                    .unwrap_or_else(|_| "Unknown".to_string()),
+                                Err(_) => "Unknown".to_string(),
+                            };
+                            let _ = tx.send_blocking(IncomingData::Stations(
+                                stations,
+                                sync_time,
+                                is_load_more,
+                            ));
+                        }
+                        Err(_e) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!("Failed to parse stations JSON: {}", _e);
+                            let _ = tx.send_blocking(IncomingData::Error(
+                                "Failed to parse station list".to_string(),
+                            ));
+                        }
                     }
                 }
+                Err(_e) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("Failed to fetch stations: {}", _e);
+                    let _ = tx.send_blocking(IncomingData::Error(
+                        "Failed to fetch stations".to_string(),
+                    ));
+                }
             }
-        });
+        } else {
+            match client.get(&url).header("User-Agent", user_agent).send().await {
+                Ok(response) => {
+                    match response.json::<Vec<BrowseItem>>().await {
+                        Ok(cats) => {
+                            let filtered = cats.into_iter().filter(|c| !c.name.trim().is_empty()).take(100).collect();
+                            let _ = tx.send_blocking(IncomingData::Categories(target_view, filtered));
+                        }
+                        Err(_e) => {
+                            #[cfg(debug_assertions)]
+                            eprintln!("Failed to parse categories JSON: {}", _e);
+                            let _ = tx.send_blocking(IncomingData::Error(
+                                "Failed to parse categories".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Err(_e) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("Failed to fetch categories: {}", _e);
+                    let _ = tx.send_blocking(IncomingData::Error(
+                        "Failed to fetch categories".to_string(),
+                    ));
+                }
+            }
+        }
     });
 }
 
@@ -831,19 +933,19 @@ fn filter_stations_local(mut stations: Vec<Station>, bitrate: BitrateFilterSetti
     match bitrate {
         BitrateFilterSetting::None => return stations,
         BitrateFilterSetting::Low => {
-            stations.retain(|s| s.bitrate.map_or(true, |b| b <= 160));
-            stations.sort_by(|a, b| b.bitrate.unwrap_or(0).cmp(&a.bitrate.unwrap_or(0)));
+            stations.retain(|s| s.bitrate.is_none_or(|b| b <= 160));
+            stations.sort_by_key(|b| std::cmp::Reverse(b.bitrate.unwrap_or(0)));
         }
         BitrateFilterSetting::High => {
-            stations.retain(|s| s.bitrate.map_or(true, |b| b >= 192));
-            stations.sort_by(|a, b| b.bitrate.unwrap_or(0).cmp(&a.bitrate.unwrap_or(0)));
+            stations.retain(|s| s.bitrate.is_none_or(|b| b >= 192));
+            stations.sort_by_key(|b| std::cmp::Reverse(b.bitrate.unwrap_or(0)));
         }
         BitrateFilterSetting::Flac => {
             stations.retain(|s| {
-                s.bitrate.map_or(true, |b| b >= 500)
+                s.bitrate.is_none_or(|b| b >= 500)
                     || s.tags.to_lowercase().contains("flac")
             });
-            stations.sort_by(|a, b| b.bitrate.unwrap_or(0).cmp(&a.bitrate.unwrap_or(0)));
+            stations.sort_by_key(|b| std::cmp::Reverse(b.bitrate.unwrap_or(0)));
         }
     }
     stations
@@ -999,9 +1101,9 @@ fn build_ui(app: &Application) {
     let player_state = Arc::new(Mutex::new(PlayerState { pipeline: None, bus_guard: None, is_paused: false, current_metadata, currently_playing_station: None }));
     
     let app_prefs = Arc::new(Mutex::new(AppPreferences { 
-        prefer_high_bitrate: true, 
-        hide_broken: true, 
-        auto_update: true,
+        prefer_high_bitrate: saved_data.prefer_high_bitrate,
+        hide_broken: saved_data.hide_broken,
+        auto_update: saved_data.auto_update,
         analyzer_type: match saved_data.analyzer_type.as_str() {
             "Bars" => AnalyzerType::Bars,
             "Wave" => AnalyzerType::Wave,
@@ -1599,7 +1701,7 @@ fn build_ui(app: &Application) {
             .title("Database Statistics &amp; Cache Lifecycle Telemetry")
             .build();
         let stats_display = Label::builder()
-            .label(&format!(
+            .label(format!(
                 "Total Working Stations Loaded: {}\nLast Radio-Browser Sync: {}\nTotal Categories / Stations Fetched: {}",
                 current_ui.last_stations_updated_count,
                 current_ui.last_update_timestamp,
@@ -1758,7 +1860,7 @@ fn build_ui(app: &Application) {
             };
             logo.set_filename(Some(icon_path));
             let app_label = Label::builder()
-                .label(&format!("Rust Radio v{}", env!("CARGO_PKG_VERSION")))
+                .label(format!("Rust Radio v{}", env!("CARGO_PKG_VERSION")))
                 .css_classes(vec!["title-1".to_string()])
                 .halign(gtk::Align::Center)
                 .build();
@@ -2172,7 +2274,7 @@ fn build_ui(app: &Application) {
                 let n = btns_container.observe_children().n_items();
                 for i in 0..n {
                     if let Some(child) = btns_container.observe_children().item(i) {
-                        if let Some(row) = child.downcast::<Box>().ok() {
+                        if let Ok(row) = child.downcast::<Box>() {
                             if let Some(cb) = row.first_child().and_then(|c| c.downcast::<Button>().ok()) {
                                 let tag_name = cb.tooltip_text().unwrap_or_default();
                                 if let Some(box_child) = cb.child() {
@@ -2376,7 +2478,7 @@ fn build_ui(app: &Application) {
     search_entry.connect_activate(move |entry| {
         let query = entry.text().to_string();
         if !query.is_empty() {
-            let target_url = format!("https://de1.api.radio-browser.info/json/stations/byname/{}", query);
+            let target_url = format!("https://de1.api.radio-browser.info/json/stations/byname/{}", urlencoding::encode(&query));
             let mut ui = ui_search.lock().unwrap();
             ui.previous_view = Some(ui.current_view.clone());
             ui.previous_url = ui.last_fetched_url.clone();
@@ -2401,41 +2503,41 @@ fn build_ui(app: &Application) {
         match ui.current_view {
             ViewType::Tags | ViewType::Languages | ViewType::Countries => {
                 if asc {
-                    ui.categories.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    ui.categories.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.categories.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
+                    ui.categories.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
                 let _ = tx_abc_sort.send_blocking(IncomingData::Categories(ui.current_view.clone(), ui.categories.clone()));
             }
             ViewType::Stations | ViewType::CustomTag(_) => {
                 if asc {
-                    ui.stations.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    ui.stations.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.stations.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
+                    ui.stations.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
                 let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.stations.clone(), ui.last_update_timestamp.clone(), false));
             }
             ViewType::Playlists => {
                 if asc {
-                    ui.playlists.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    ui.playlists.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.playlists.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
+                    ui.playlists.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
                 let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.playlists.clone(), ui.last_update_timestamp.clone(), false));
             }
             ViewType::Favorites => {
                 if asc {
-                    ui.favorites.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    ui.favorites.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.favorites.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
+                    ui.favorites.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
                 let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.favorites.clone(), ui.last_update_timestamp.clone(), false));
             }
             ViewType::Recent => {
                 if asc {
-                    ui.recent_stations.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    ui.recent_stations.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.recent_stations.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
+                    ui.recent_stations.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
                 let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.recent_stations.clone(), ui.last_update_timestamp.clone(), false));
             }
@@ -2475,6 +2577,8 @@ fn build_ui(app: &Application) {
             list_box_fav.remove(&child);
         }
         let mut ui = ui_fav_menu.lock().unwrap();
+        ui.previous_view = Some(ui.current_view.clone());
+        ui.previous_url = ui.last_fetched_url.clone();
         ui.current_view = ViewType::Favorites;
         browsing_fav.set_text("Favorite Stations");
         let display_list: Vec<Station> = if ui.active_bitrate != BitrateFilterSetting::None {
@@ -2503,14 +2607,14 @@ fn build_ui(app: &Application) {
                 .valign(gtk::Align::Center)
                 .tooltip_text("Remove from favourites")
                 .build();
-            let uuid_to_remove = station.stationuuid.clone();
+            let station_to_remove = station.clone();
             let ui_rm_fav = ui_fav_menu.clone();
             let list_rm_fav = list_box_fav.clone();
             let count_rm_fav = count_lbl_fav.clone();
             let row_clone = row.clone();
             let save_mgr_fav_rm = state_fav_rm_save.clone();
             remove_fav_btn.connect_clicked(move |_| {
-                ui_rm_fav.lock().unwrap().favorites.retain(|f| f.stationuuid != uuid_to_remove);
+                ui_rm_fav.lock().unwrap().favorites.retain(|f| !station_eq(f, &station_to_remove));
                 save_mgr_fav_rm.save_data();
                 list_rm_fav.remove(&row_clone);
                 let remaining = ui_rm_fav.lock().unwrap().favorites.len();
@@ -2536,6 +2640,8 @@ fn build_ui(app: &Application) {
             list_box_recent.remove(&child);
         }
         let mut ui = ui_recent_menu.lock().unwrap();
+        ui.previous_view = Some(ui.current_view.clone());
+        ui.previous_url = ui.last_fetched_url.clone();
         ui.current_view = ViewType::Recent;
         browsing_recent.set_text("Recently Played");
         let display_list: Vec<Station> = if ui.active_bitrate != BitrateFilterSetting::None {
@@ -2578,6 +2684,8 @@ fn build_ui(app: &Application) {
             list_box_playlists.remove(&child);
         }
         let mut view = ui_playlists_view.lock().unwrap();
+        view.previous_view = Some(view.current_view.clone());
+        view.previous_url = view.last_fetched_url.clone();
         view.current_view = ViewType::Playlists;
         view.active_category = CategoryFilter::None;
         let stations = if view.playlists.is_empty() {
@@ -2646,7 +2754,7 @@ fn build_ui(app: &Application) {
                             cf.set_text(&format!("{} stations in playlist", vv.playlists.len()));
                             let stations = vv.playlists.clone();
                             drop(vv);
-                            for (_, s) in stations.iter().enumerate() {
+                            for s in stations.iter() {
                                 let row = ActionRow::builder()
                                     .title(glib::markup_escape_text(s.name.trim()).to_string())
                                     .subtitle(glib::markup_escape_text(&s.url_resolved).to_string())
@@ -2929,14 +3037,21 @@ fn build_ui(app: &Application) {
         };
         let mut state = state_play_pause.lock().unwrap();
         if state.currently_playing_station.is_some() {
-            if !state.is_paused {
-                let _ = state.pipeline.as_ref().unwrap().set_state(gstreamer::State::Paused);
-                state.is_paused = true;
-                btn.set_icon_name("media-playback-start-symbolic");
-            } else {
-                let _ = state.pipeline.as_ref().unwrap().set_state(gstreamer::State::Playing);
-                state.is_paused = false;
-                btn.set_icon_name("media-playback-pause-symbolic");
+            match state.pipeline.clone() {
+                Some(pipeline) => {
+                    if !state.is_paused {
+                        let _ = pipeline.set_state(gstreamer::State::Paused);
+                        state.is_paused = true;
+                        btn.set_icon_name("media-playback-start-symbolic");
+                    } else {
+                        let _ = pipeline.set_state(gstreamer::State::Playing);
+                        state.is_paused = false;
+                        btn.set_icon_name("media-playback-pause-symbolic");
+                    }
+                }
+                None => {
+                    btn.set_icon_name("media-playback-start-symbolic");
+                }
             }
         } else {
             drop(state);
@@ -3031,7 +3146,7 @@ fn build_ui(app: &Application) {
         let player = state_fav_toggle.lock().unwrap();
         if let Some(current_station) = &player.currently_playing_station {
             let mut ui = ui_fav_toggle.lock().unwrap();
-            if let Some(pos) = ui.favorites.iter().position(|f| f.stationuuid == current_station.stationuuid) {
+            if let Some(pos) = ui.favorites.iter().position(|f| station_eq(f, current_station)) {
                 ui.favorites.remove(pos);
                 btn.set_icon_name("non-starred-symbolic");
             } else {
@@ -3094,6 +3209,13 @@ fn build_ui(app: &Application) {
             }
 
             match data {
+                IncomingData::Error(msg) => {
+                    br_area_rx.set_visible(true);
+                    import_btn_rx.set_visible(false);
+                    clear_recents_rx.set_visible(false);
+                    now_browsing_label_clone.set_text(&msg);
+                    stations_count_label_clone.set_text("");
+                }
                 IncomingData::Categories(view_mode, items) => {
                     br_area_rx.set_visible(true);
                     import_btn_rx.set_visible(false);
@@ -3151,7 +3273,7 @@ fn build_ui(app: &Application) {
                             let add_btn = Button::builder()
                                 .icon_name("list-add-symbolic")
                                 .css_classes(vec!["flat".to_string()])
-                                .tooltip_text(&format!("Add \"{}\" to custom tags", tag_name))
+                                .tooltip_text(format!("Add \"{}\" to custom tags", tag_name))
                                 .valign(gtk::Align::Center)
                                 .build();
 
@@ -3199,7 +3321,7 @@ fn build_ui(app: &Application) {
                                     let n = btns_for_add_c.observe_children().n_items();
                                     for i in 0..n {
                                         if let Some(child) = btns_for_add_c.observe_children().item(i) {
-                                            if let Some(row) = child.downcast::<Box>().ok() {
+                        if let Ok(row) = child.downcast::<Box>() {
                                                 if let Some(cb) = row.first_child().and_then(|c| c.downcast::<Button>().ok()) {
                                                     let tag_name = cb.tooltip_text().unwrap_or_default();
                                                     if let Some(box_child) = cb.child() {
@@ -3324,7 +3446,8 @@ fn build_ui(app: &Application) {
                     };
                     br_area_rx.set_visible(!matches!(ui.current_view, ViewType::Playlists) && !matches!(prev_view, ViewType::Playlists));
                     let is_playlists_view = matches!(ui.current_view, ViewType::Playlists);
-                    let fav_uuids: HashSet<String> = ui.favorites.iter().map(|f| f.stationuuid.clone()).collect();
+                    let fav_api_uuids: HashSet<String> = ui.favorites.iter().filter(|f| !f.stationuuid.is_empty()).map(|f| f.stationuuid.clone()).collect();
+                    let fav_imported: HashSet<(String, String)> = ui.favorites.iter().filter(|f| f.stationuuid.is_empty()).map(|f| (f.url_resolved.clone(), f.name.clone())).collect();
                     let total_stations = stations_list.len();
                     drop(ui);
                     state_rx_save.save_data();
@@ -3345,7 +3468,11 @@ fn build_ui(app: &Application) {
                                 subtitle = format!("{} | {} kbps", subtitle, br);
                             }
                         }
-                        let is_fav = fav_uuids.contains(&station.stationuuid);
+                        let is_fav = if station.stationuuid.is_empty() {
+                            fav_imported.contains(&(station.url_resolved.clone(), station.name.clone()))
+                        } else {
+                            fav_api_uuids.contains(&station.stationuuid)
+                        };
                         StationDisplay { title_escaped, subtitle, station, is_fav }
                     }).collect();
 
@@ -3470,7 +3597,7 @@ fn build_ui(app: &Application) {
                             let save_mgr_row_fav = state_batch.clone();
                             row_fav_btn.connect_clicked(move |btn| {
                                 let mut ui = ui_for_row_fav.lock().unwrap();
-                                if let Some(pos) = ui.favorites.iter().position(|f| f.stationuuid == display_rc_clone[station_idx].station.stationuuid) {
+                                if let Some(pos) = ui.favorites.iter().position(|f| station_eq(f, &display_rc_clone[station_idx].station)) {
                                     ui.favorites.remove(pos);
                                     btn.set_icon_name("non-starred-symbolic");
                                 } else {
@@ -3490,6 +3617,9 @@ fn build_ui(app: &Application) {
                                     .build();
                                 let ui_for_rm = ui_batch.clone();
                                 let save_rm = state_batch.clone();
+                                let list_box_rm = list_box_batch.clone();
+                                let count_rm = count_label.clone();
+                                let row_rm = row.clone();
                                 let station_uuid = data.station.stationuuid.clone();
                                 let station_url = data.station.url_resolved.clone();
                                 let station_name = data.station.name.clone();
@@ -3504,6 +3634,9 @@ fn build_ui(app: &Application) {
                                         v.playlists.remove(idx);
                                         drop(v);
                                         save_rm.save_data();
+                                        list_box_rm.remove(&row_rm);
+                                        let remaining = ui_for_rm.lock().unwrap().playlists.len();
+                                        count_rm.set_text(&format!("{} stations in playlist", remaining));
                                     }
                                 });
                                 row.add_suffix(&rm_btn);
@@ -3530,12 +3663,14 @@ fn build_ui(app: &Application) {
         loop {
             let wants_update = prefs_cron_tracker.lock().unwrap().auto_update;
             if wants_update {
-                let current_url = ui_cron_tracker.lock().unwrap().last_fetched_url.clone();
-                let view = ui_cron_tracker.lock().unwrap().current_view.clone();
-                let is_stations = !matches!(view,
-                    ViewType::Tags | ViewType::Languages | ViewType::Countries
-                );
-                fetch_data_async(current_url, is_stations, view, prefs_cron_tracker.clone(), tx_cron_tracker.clone(), false);
+                let (current_url, view) = {
+                    let ui = ui_cron_tracker.lock().unwrap();
+                    (ui.last_fetched_url.clone(), ui.current_view.clone())
+                };
+                // Only auto-refresh live station lists, never local views.
+                if matches!(view, ViewType::Stations | ViewType::CustomTag(_)) {
+                    fetch_data_async(current_url, true, view, prefs_cron_tracker.clone(), tx_cron_tracker.clone(), false);
+                }
             }
             std::thread::sleep(Duration::from_secs(21600));
         }
