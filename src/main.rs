@@ -1,16 +1,20 @@
 use adw::prelude::*;
-use gtk::prelude::Cast;
-use gstreamer::prelude::*;
-use gstreamer::prelude::ObjectExt as GstObjectExt;
+use adw::{ActionRow, ApplicationWindow, ComboRow, HeaderBar, PreferencesGroup, PreferencesPage};
 use dns_lookup::lookup_addr;
-use adw::{ActionRow, ApplicationWindow, HeaderBar, PreferencesGroup, PreferencesPage, ComboRow};
-use gtk::{Application, Box, Button, DrawingArea, Label, ListBox, MenuButton, Orientation, Paned, Popover, Scale, ScrolledWindow, SearchEntry, Switch, StringList};
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use gstreamer::prelude::ObjectExt as GstObjectExt;
+use gstreamer::prelude::*;
+use gtk::prelude::Cast;
+use gtk::{
+    Application, Box, Button, DrawingArea, Label, ListBox, MenuButton, Orientation, Paned, Popover,
+    Scale, ScrolledWindow, SearchEntry, StringList, Switch,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::collections::HashSet;
+use std::io::Write;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 fn make_stats_label() -> Rc<RefCell<Option<gtk::Label>>> {
@@ -19,12 +23,79 @@ fn make_stats_label() -> Rc<RefCell<Option<gtk::Label>>> {
 
 static SCROLL_TO_ROW: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RENDER_GEN: AtomicUsize = AtomicUsize::new(0);
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+static REQUEST_CANCEL: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static HTTP_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-fn station_limit() -> &'static AtomicUsize {
-    static LIMIT: OnceLock<AtomicUsize> = OnceLock::new();
-    LIMIT.get_or_init(|| AtomicUsize::new(250))
+const INITIAL_STATION_LIMIT: usize = 250;
+const STATION_PAGE_SIZE: usize = 50;
+const MAX_STATION_LIMIT: usize = 5_000;
+const MAX_API_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PLAYLIST_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_PLAYLIST_STATIONS: usize = 5_000;
+const MAX_BACKUP_BYTES: u64 = 10 * 1024 * 1024;
+
+fn begin_request() -> u64 {
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::AcqRel);
+    ACTIVE_REQUEST_ID.store(request_id, Ordering::Release);
+    RENDER_GEN.fetch_add(1, Ordering::AcqRel);
+    SCROLL_TO_ROW.store(usize::MAX, Ordering::Release);
+    if let Some(cancel) = REQUEST_CANCEL.get() {
+        cancel.send_replace(request_id);
+    }
+    request_id
+}
+
+fn request_cancel_receiver(request_id: u64) -> tokio::sync::watch::Receiver<u64> {
+    REQUEST_CANCEL
+        .get_or_init(|| {
+            let (sender, _) = tokio::sync::watch::channel(request_id);
+            sender
+        })
+        .subscribe()
+}
+
+fn is_active_request(request_id: u64) -> bool {
+    ACTIVE_REQUEST_ID.load(Ordering::Acquire) == request_id
+}
+
+fn parse_url_limit(url: &str) -> Option<usize> {
+    let start = url.find("limit=")? + "limit=".len();
+    let digits: String = url[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse::<usize>().ok()
+}
+
+fn set_url_limit(mut url: String, limit: usize) -> String {
+    if let Some(pos) = url.find("limit=") {
+        let start = pos + "limit=".len();
+        let end = url[start..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map(|offset| start + offset)
+            .unwrap_or(url.len());
+        url.replace_range(start..end, &limit.to_string());
+    } else {
+        let separator = if url.contains('?') { "&" } else { "?" };
+        url.push_str(&format!("{}limit={}", separator, limit));
+    }
+    url
+}
+
+fn clamp_station_limit(limit: usize) -> usize {
+    limit.clamp(INITIAL_STATION_LIMIT, MAX_STATION_LIMIT)
+}
+
+fn read_limited_text(path: &std::path::Path, max_bytes: u64) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if metadata.len() > max_bytes {
+        return Err(format!("File is larger than {} bytes", max_bytes));
+    }
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -60,6 +131,8 @@ fn station_eq(a: &Station, b: &Station) -> bool {
 struct BrowseItem {
     name: String,
     stationcount: u32,
+    #[serde(default, alias = "iso_3166_1")]
+    countrycode: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -109,6 +182,13 @@ enum ViewType {
     CustomTag(String),
 }
 
+fn station_response_view(view: &ViewType) -> ViewType {
+    match view {
+        ViewType::CustomTag(tag) => ViewType::CustomTag(tag.clone()),
+        _ => ViewType::Stations,
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 enum CategoryFilter {
     None,
@@ -141,6 +221,8 @@ struct UIState {
     last_update_timestamp: String,
     total_elements_fetched: usize,
     last_stations_updated_count: usize,
+    station_limit: usize,
+    station_has_more_hint: bool,
     cached_tags: Option<Vec<BrowseItem>>,
     cached_languages: Option<Vec<BrowseItem>>,
     cached_countries: Option<Vec<BrowseItem>>,
@@ -149,29 +231,49 @@ struct UIState {
 struct PlayerState {
     pipeline: Option<gstreamer::Element>,
     bus_guard: Option<gstreamer::bus::BusWatchGuard>,
+    generation: u64,
     is_paused: bool,
     current_metadata: Arc<Mutex<AudioMetadata>>,
     currently_playing_station: Option<Station>,
+    playlist_view: Option<ViewType>,
 }
 
 // --- PERSISTENCE ---
-fn default_bitrate_str() -> String { "None".to_string() }
+fn default_bitrate_str() -> String {
+    "None".to_string()
+}
 
-fn default_audio_sink() -> String { "autoaudiosink".to_string() }
+fn default_audio_sink() -> String {
+    "autoaudiosink".to_string()
+}
 
-fn default_disable_video_streams() -> bool { false }
+fn default_disable_video_streams() -> bool {
+    false
+}
 
-fn default_disable_audio_buffer() -> bool { false }
+fn default_disable_audio_buffer() -> bool {
+    false
+}
 
-fn default_analyzer_type() -> String { "BlocksWithHold".to_string() }
+fn default_analyzer_type() -> String {
+    "BlocksWithHold".to_string()
+}
 
-fn default_volume() -> f64 { 1.0 }
+fn default_volume() -> f64 {
+    1.0
+}
 
-fn default_prefer_high_bitrate() -> bool { true }
+fn default_prefer_high_bitrate() -> bool {
+    true
+}
 
-fn default_hide_broken() -> bool { true }
+fn default_hide_broken() -> bool {
+    true
+}
 
-fn default_auto_update() -> bool { true }
+fn default_auto_update() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize)]
 struct SavedData {
@@ -236,7 +338,10 @@ impl AppState {
     fn save_data(&self) {
         let mut path = gtk::glib::user_config_dir();
         path.push("RustRadioGTK");
-        let _ = std::fs::create_dir_all(&path);
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            eprintln!("Failed to create configuration directory: {}", err);
+            return;
+        }
         path.push("saved_data.json");
 
         let ui = self.ui.lock().unwrap();
@@ -247,10 +352,11 @@ impl AppState {
         let playlists = ui.playlists.clone();
         let active_bitrate = match ui.active_bitrate {
             BitrateFilterSetting::None => "None",
-            BitrateFilterSetting::Low  => "Low",
+            BitrateFilterSetting::Low => "Low",
             BitrateFilterSetting::High => "High",
             BitrateFilterSetting::Flac => "Flac",
-        }.to_string();
+        }
+        .to_string();
         drop(ui);
         let prefs = self.prefs.lock().unwrap();
         let custom_tags = prefs.custom_tags.clone();
@@ -266,7 +372,8 @@ impl AppState {
             AnalyzerType::Wave => "Wave",
             AnalyzerType::BlocksWithHold => "BlocksWithHold",
             AnalyzerType::DigitalVuBlocks => "DigitalVuBlocks",
-        }.to_string();
+        }
+        .to_string();
         drop(prefs);
 
         let data = SavedData {
@@ -287,26 +394,59 @@ impl AppState {
             auto_update,
         };
 
-        if let Ok(json) = serde_json::to_string(&data) {
-            let _ = std::fs::write(path, json);
+        let json = match serde_json::to_vec(&data) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("Failed to serialize saved data: {}", err);
+                return;
+            }
+        };
+
+        // Keep the previous file intact until the complete replacement is ready.
+        let temp_path = path.with_file_name("saved_data.json.tmp");
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            std::fs::rename(&temp_path, &path)
+        })();
+        if let Err(err) = write_result {
+            eprintln!("Failed to save application data: {}", err);
+            let _ = std::fs::remove_file(temp_path);
         }
     }
-    
+
     fn load_data() -> SavedData {
         let mut path = gtk::glib::user_config_dir();
         path.push("RustRadioGTK");
         path.push("saved_data.json");
 
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(data) => data,
+                Err(err) => {
+                    eprintln!("Saved data is invalid: {}", err);
+                    let corrupt_path = path.with_file_name("saved_data.json.corrupt");
+                    let _ = std::fs::copy(&path, corrupt_path);
+                    SavedData::default()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => SavedData::default(),
+            Err(err) => {
+                eprintln!("Failed to read saved data: {}", err);
+                SavedData::default()
+            }
+        }
     }
 }
 
 fn main() {
     gstreamer::init().expect("Failed to initialize GStreamer.");
-    
+
     let application = Application::builder()
         .application_id("io.github.antoxa78.RustRadio")
         .build();
@@ -321,28 +461,314 @@ fn calculate_adaptive_buffer(bitrate_kbps: Option<u32>) -> i64 {
     match bitrate_kbps {
         Some(bitrate) => {
             let duration_seconds = match bitrate {
-                0..=96 => 20,        // Low bitrate (64-96 kbps): 20 seconds
-                97..=192 => 15,      // Medium bitrate (128-192 kbps): 15 seconds
-                193..=320 => 10,     // High bitrate (256-320 kbps): 10 seconds
-                _ => 8,              // Very high bitrate (>320 kbps): 8 seconds
+                0..=96 => 20,    // Low bitrate (64-96 kbps): 20 seconds
+                97..=192 => 15,  // Medium bitrate (128-192 kbps): 15 seconds
+                193..=320 => 10, // High bitrate (256-320 kbps): 10 seconds
+                _ => 8,          // Very high bitrate (>320 kbps): 8 seconds
             };
             #[cfg(debug_assertions)]
-            eprintln!("📊 Adaptive Buffer: {} kbps → {} seconds buffer", bitrate, duration_seconds);
-            duration_seconds * 1_000_000_000i64  // Convert to nanoseconds
+            eprintln!(
+                "📊 Adaptive Buffer: {} kbps → {} seconds buffer",
+                bitrate, duration_seconds
+            );
+            duration_seconds * 1_000_000_000i64 // Convert to nanoseconds
         }
         None => {
             #[cfg(debug_assertions)]
             eprintln!("📊 Adaptive Buffer: Unknown bitrate → 10 seconds buffer (default)");
-            10_000_000_000i64  // Default 10 seconds
+            10_000_000_000i64 // Default 10 seconds
+        }
+    }
+}
+
+fn is_allowed_stream_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else {
+            return false;
+        };
+        let suffix = &authority[close + 1..];
+        if !suffix.is_empty()
+            && (!suffix.starts_with(':')
+                || suffix.len() == 1
+                || suffix[1..].parse::<u16>().is_err())
+        {
+            return false;
+        }
+        &authority[1..close]
+    } else {
+        if authority.matches(':').count() > 1 {
+            return false;
+        }
+        if let Some((host, port)) = authority.rsplit_once(':') {
+            if host.is_empty() || port.parse::<u16>().is_err() {
+                return false;
+            }
+            host
+        } else {
+            authority
+        }
+    };
+    let normalized_host = host.trim_end_matches('.');
+    let host_lower = normalized_host.to_ascii_lowercase();
+    if normalized_host.is_empty()
+        || host_lower == "localhost"
+        || host_lower.ends_with(".localhost")
+        || host_lower.ends_with(".local")
+        || host_lower.ends_with(".internal")
+    {
+        return false;
+    }
+    if let Ok(ip) = normalized_host.parse::<std::net::IpAddr>() {
+        if is_local_or_private_ip(ip) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_local_or_private_ip(ip: std::net::IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            let unique_local = segments[0] & 0xfe00 == 0xfc00;
+            let link_local = segments[0] & 0xffc0 == 0xfe80;
+            let ipv4_mapped =
+                segments[..5].iter().all(|segment| *segment == 0) && segments[5] == 0xffff;
+            let mapped_private = if ipv4_mapped {
+                let mapped = std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                mapped.is_private() || mapped.is_link_local() || mapped.is_loopback()
+            } else {
+                false
+            };
+            unique_local || link_local || mapped_private
+        }
+    }
+}
+
+fn stream_host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let host = &authority[1..close];
+        let suffix = &authority[close + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            suffix.strip_prefix(':')?.parse().ok()?
+        };
+        return Some((host.to_string(), port));
+    }
+    if authority.matches(':').count() > 1 {
+        return None;
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        Some((host.to_string(), port.parse().ok()?))
+    } else {
+        Some((authority.to_string(), default_port))
+    }
+}
+
+async fn host_resolves_to_public(host: String, port: u16) -> bool {
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await;
+    match resolved {
+        Ok(Ok(addresses)) => {
+            let addresses: Vec<_> = addresses.collect();
+            !addresses.is_empty()
+                && addresses
+                    .iter()
+                    .all(|address| !is_local_or_private_ip(address.ip()))
+        }
+        _ => false,
+    }
+}
+
+fn invalidate_player(player: &mut PlayerState) -> u64 {
+    player.generation = player.generation.wrapping_add(1);
+    player.bus_guard = None;
+    if let Some(old_pipeline) = player.pipeline.take() {
+        let _ = old_pipeline.set_state(gstreamer::State::Null);
+    }
+    player.is_paused = false;
+    player.currently_playing_station = None;
+    player.playlist_view = None;
+    if let Ok(mut metadata) = player.current_metadata.lock() {
+        metadata.bitrate = None;
+        metadata.sample_rate = None;
+        metadata.stream_title = None;
+        metadata.codec = None;
+        metadata.bit_depth = None;
+        metadata.buffering_percent = None;
+    }
+    player.generation
+}
+
+fn station_list_for_view<'a>(ui: &'a UIState, view: &ViewType) -> &'a [Station] {
+    let use_filtered_local = ui.active_bitrate != BitrateFilterSetting::None
+        && matches!(
+            view,
+            ViewType::Favorites | ViewType::Recent | ViewType::Playlists
+        );
+    if use_filtered_local {
+        &ui.stations
+    } else {
+        match view {
+            ViewType::Favorites => &ui.favorites,
+            ViewType::Recent => &ui.recent_stations,
+            ViewType::Playlists => &ui.playlists,
+            _ => &ui.stations,
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn play_station(
-    player_lock: &Arc<Mutex<PlayerState>>, 
+fn schedule_station_fallback(
+    player_lock: &Arc<Mutex<PlayerState>>,
     ui_lock: &Arc<Mutex<UIState>>,
-    index: usize, 
+    next_index: Option<usize>,
+    expected_generation: u64,
+    play_pause_btn: &Button,
+    now_playing_title: &Label,
+    now_playing_subtitle: &Label,
+    stream_meta_label: &Label,
+    stream_info_label: &Label,
+    fav_toggle_btn: &Button,
+    now_playing_flag_lbl: &Label,
+    save_mgr: &Arc<AppState>,
+    prefs: &Arc<Mutex<AppPreferences>>,
+) -> bool {
+    let Some(index) = next_index else {
+        return false;
+    };
+    let view = match player_lock.lock() {
+        Ok(player) => player.playlist_view.clone(),
+        Err(_) => return false,
+    };
+    let total = {
+        let ui = ui_lock.lock().unwrap();
+        let view = view.unwrap_or_else(|| ui.current_view.clone());
+        station_list_for_view(&ui, &view).len()
+    };
+    if index >= total {
+        return false;
+    }
+
+    let player_rc = player_lock.clone();
+    let ui_rc = ui_lock.clone();
+    let btn_rc = play_pause_btn.clone();
+    let title_rc = now_playing_title.clone();
+    let subtitle_rc = now_playing_subtitle.clone();
+    let meta_rc = stream_meta_label.clone();
+    let info_rc = stream_info_label.clone();
+    let fav_rc = fav_toggle_btn.clone();
+    let flag_rc = now_playing_flag_lbl.clone();
+    let save_rc = save_mgr.clone();
+    let prefs_rc = prefs.clone();
+    let player_check = player_rc.clone();
+    let expected_request = ACTIVE_REQUEST_ID.load(Ordering::Acquire);
+    glib::idle_add_local_once(move || {
+        if !is_active_request(expected_request)
+            || player_check
+                .lock()
+                .map(|player| player.generation != expected_generation)
+                .unwrap_or(true)
+        {
+            return;
+        }
+        play_station(
+            &player_rc,
+            &ui_rc,
+            index,
+            &btn_rc,
+            &title_rc,
+            &subtitle_rc,
+            &meta_rc,
+            &info_rc,
+            &fav_rc,
+            &flag_rc,
+            &save_rc,
+            &prefs_rc,
+        );
+    });
+    true
+}
+
+fn request_more_stations(
+    list_box: &ListBox,
+    load_row: &ActionRow,
+    tx: &async_channel::Sender<IncomingData>,
+    prefs: &Arc<Mutex<AppPreferences>>,
+    ui_lock: &Arc<Mutex<UIState>>,
+) {
+    let old_limit = {
+        let ui = ui_lock.lock().unwrap();
+        if !matches!(ui.current_view, ViewType::Stations | ViewType::CustomTag(_)) {
+            return;
+        }
+        ui.station_limit
+    };
+    if old_limit >= MAX_STATION_LIMIT {
+        return;
+    }
+
+    list_box.remove(load_row);
+    let loading_row = ActionRow::builder()
+        .title("Loading more stations...")
+        .activatable(false)
+        .build();
+    let spinner = gtk::Spinner::builder().valign(gtk::Align::Center).build();
+    spinner.set_size_request(16, 16);
+    spinner.start();
+    loading_row.add_suffix(&spinner);
+    list_box.append(&loading_row);
+
+    let new_limit = (old_limit + STATION_PAGE_SIZE).min(MAX_STATION_LIMIT);
+    let mut ui = ui_lock.lock().unwrap();
+    ui.station_limit = new_limit;
+    let url = set_url_limit(ui.last_fetched_url.clone(), new_limit);
+    let view = ui.current_view.clone();
+    drop(ui);
+    fetch_data_async(url, true, view, prefs.clone(), tx.clone(), true);
+    SCROLL_TO_ROW.store(old_limit, Ordering::Release);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn play_station(
+    player_lock: &Arc<Mutex<PlayerState>>,
+    ui_lock: &Arc<Mutex<UIState>>,
+    index: usize,
     play_pause_btn: &Button,
     now_playing_title: &Label,
     now_playing_subtitle: &Label,
@@ -353,37 +779,167 @@ fn play_station(
     save_mgr: &Arc<AppState>,
     prefs: &Arc<Mutex<AppPreferences>>,
 ) {
+    play_station_internal(
+        player_lock,
+        ui_lock,
+        index,
+        play_pause_btn,
+        now_playing_title,
+        now_playing_subtitle,
+        stream_meta_label,
+        stream_info_label,
+        fav_toggle_btn,
+        now_playing_flag_lbl,
+        save_mgr,
+        prefs,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn play_station_internal(
+    player_lock: &Arc<Mutex<PlayerState>>,
+    ui_lock: &Arc<Mutex<UIState>>,
+    index: usize,
+    play_pause_btn: &Button,
+    now_playing_title: &Label,
+    now_playing_subtitle: &Label,
+    stream_meta_label: &Label,
+    stream_info_label: &Label,
+    fav_toggle_btn: &Button,
+    now_playing_flag_lbl: &Label,
+    save_mgr: &Arc<AppState>,
+    prefs: &Arc<Mutex<AppPreferences>>,
+    url_prevalidated: bool,
+) {
     let mut ui = ui_lock.lock().unwrap();
     let is_filtered = ui.active_bitrate != BitrateFilterSetting::None;
-    let station = if is_filtered && matches!(ui.current_view, ViewType::Favorites | ViewType::Recent | ViewType::Playlists) {
-        if index >= ui.stations.len() { return; }
+    let station = if is_filtered
+        && matches!(
+            ui.current_view,
+            ViewType::Favorites | ViewType::Recent | ViewType::Playlists
+        ) {
+        if index >= ui.stations.len() {
+            return;
+        }
         ui.current_index = Some(index);
         ui.stations[index].clone()
     } else {
         match ui.current_view {
             ViewType::Favorites => {
-                if index >= ui.favorites.len() { return; }
+                if index >= ui.favorites.len() {
+                    return;
+                }
                 ui.current_index = Some(index);
                 ui.favorites[index].clone()
             }
             ViewType::Recent => {
-                if index >= ui.recent_stations.len() { return; }
+                if index >= ui.recent_stations.len() {
+                    return;
+                }
                 ui.current_index = Some(index);
                 ui.recent_stations[index].clone()
             }
             ViewType::Playlists => {
-                if index >= ui.playlists.len() { return; }
+                if index >= ui.playlists.len() {
+                    return;
+                }
                 ui.current_index = Some(index);
                 ui.playlists[index].clone()
             }
             _ => {
-                if index >= ui.stations.len() { return; }
+                if index >= ui.stations.len() {
+                    return;
+                }
                 ui.current_index = Some(index);
                 ui.stations[index].clone()
             }
         }
     };
-    
+    let playback_view = ui.current_view.clone();
+
+    if !is_allowed_stream_url(&station.url_resolved) {
+        drop(ui);
+        let mut player = player_lock.lock().unwrap();
+        invalidate_player(&mut player);
+        drop(player);
+        play_pause_btn.set_icon_name("media-playback-start-symbolic");
+        stream_meta_label.set_text("(Unsupported stream URL)");
+        stream_info_label.set_text("");
+        return;
+    }
+
+    if !url_prevalidated {
+        if let Some((host, port)) = stream_host_port(&station.url_resolved) {
+            if host.parse::<std::net::IpAddr>().is_err() {
+                drop(ui);
+                let (result_tx, result_rx) = async_channel::bounded(1);
+                let runtime = HTTP_RUNTIME.get_or_init(|| {
+                    tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime")
+                });
+                runtime.spawn(async move {
+                    let allowed = host_resolves_to_public(host, port).await;
+                    let _ = result_tx.send(allowed).await;
+                });
+
+                let expected_generation = {
+                    let mut player = player_lock.lock().unwrap();
+                    invalidate_player(&mut player)
+                };
+                let expected_request = ACTIVE_REQUEST_ID.load(Ordering::Acquire);
+                play_pause_btn.set_icon_name("media-playback-start-symbolic");
+                stream_meta_label.set_text("(Checking stream URL...)");
+                stream_info_label.set_text("");
+
+                let player_rc = player_lock.clone();
+                let ui_rc = ui_lock.clone();
+                let btn_rc = play_pause_btn.clone();
+                let title_rc = now_playing_title.clone();
+                let subtitle_rc = now_playing_subtitle.clone();
+                let meta_rc = stream_meta_label.clone();
+                let info_rc = stream_info_label.clone();
+                let fav_rc = fav_toggle_btn.clone();
+                let flag_rc = now_playing_flag_lbl.clone();
+                let save_rc = save_mgr.clone();
+                let prefs_rc = prefs.clone();
+                let player_check = player_rc.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    let allowed = result_rx.recv().await.unwrap_or(false);
+                    if !is_active_request(expected_request)
+                        || player_check
+                            .lock()
+                            .map(|player| player.generation != expected_generation)
+                            .unwrap_or(true)
+                    {
+                        return;
+                    }
+                    if !allowed {
+                        btn_rc.set_icon_name("media-playback-start-symbolic");
+                        meta_rc.set_text("(Stream URL resolves to a local/private address)");
+                        info_rc.set_text("");
+                        return;
+                    }
+                    play_station_internal(
+                        &player_rc,
+                        &ui_rc,
+                        index,
+                        &btn_rc,
+                        &title_rc,
+                        &subtitle_rc,
+                        &meta_rc,
+                        &info_rc,
+                        &fav_rc,
+                        &flag_rc,
+                        &save_rc,
+                        &prefs_rc,
+                        true,
+                    );
+                });
+                return;
+            }
+        }
+    }
+
     // Track recently played (keep last 50, no duplicates)
     // For imported stations (empty UUID), deduplicate by URL instead
     ui.recent_stations.retain(|s| {
@@ -395,7 +951,7 @@ fn play_station(
     });
     ui.recent_stations.insert(0, station.clone());
     ui.recent_stations.truncate(50);
-    
+
     if ui.favorites.iter().any(|f| station_eq(f, &station)) {
         fav_toggle_btn.set_icon_name("starred-symbolic");
     } else {
@@ -405,16 +961,21 @@ fn play_station(
     save_mgr.save_data();
 
     let mut player = player_lock.lock().unwrap();
-    player.is_paused = false;
+    let playback_generation = invalidate_player(&mut player);
     play_pause_btn.set_icon_name("media-playback-pause-symbolic");
 
-    now_playing_title.set_text(&glib::markup_escape_text(&station.name));
-    let br_info = station.bitrate.map_or(String::new(), |b| format!(" ({} kbps)", b));
-    now_playing_subtitle.set_text(&format!("{} | {}{}", glib::markup_escape_text(&station.country), glib::markup_escape_text(&station.tags), br_info));
+    now_playing_title.set_text(&station.name);
+    let br_info = station
+        .bitrate
+        .map_or(String::new(), |b| format!(" ({} kbps)", b));
+    now_playing_subtitle.set_text(&format!(
+        "{} | {}{}",
+        station.country, station.tags, br_info
+    ));
     let flag = country_code_to_flag(&station.countrycode);
     now_playing_flag_lbl.set_text(&flag);
     now_playing_flag_lbl.set_visible(!flag.is_empty());
-    
+
     {
         let mut meta = player.current_metadata.lock().unwrap();
         meta.bitrate = None;
@@ -430,12 +991,8 @@ fn play_station(
     let url = station.url_resolved.clone();
     let sink_name = prefs.lock().unwrap().audio_sink.clone();
     let disable_video = prefs.lock().unwrap().disable_video_streams;
-    player.bus_guard = None;
-    if let Some(old_pipeline) = player.pipeline.take() {
-        let _ = old_pipeline.set_state(gstreamer::State::Null);
-    }
-
-    let audio_sink = gstreamer::ElementFactory::make(&sink_name).build()
+    let audio_sink = gstreamer::ElementFactory::make(&sink_name)
+        .build()
         .or_else(|_| gstreamer::ElementFactory::make("autoaudiosink").build())
         .ok();
 
@@ -447,24 +1004,23 @@ fn play_station(
 
     let disable_buffer = prefs.lock().unwrap().disable_audio_buffer;
     let buffer_duration: i64 = if disable_buffer {
-        -1  // -1 = use GStreamer's default (no forced pre-buffering)
+        -1 // -1 = use GStreamer's default (no forced pre-buffering)
     } else {
         calculate_adaptive_buffer(station.bitrate)
     };
     let mut playbin_builder = gstreamer::ElementFactory::make("playbin")
         .property("uri", &url)
-        .property("buffer-duration", buffer_duration);  // Adaptive buffer based on bitrate
+        .property("buffer-duration", buffer_duration); // Adaptive buffer based on bitrate
     if let Some(ref sink) = audio_sink {
         playbin_builder = playbin_builder.property("audio-sink", sink);
     }
-    
+
     // Disable video streams if preference is enabled
     if let Some(ref sink) = video_sink {
         playbin_builder = playbin_builder.property("video-sink", sink);
     }
-    
-     if let Ok(pipeline) = playbin_builder.build()
-    {
+
+    if let Ok(pipeline) = playbin_builder.build() {
         let buffer_disabled = prefs.lock().unwrap().disable_audio_buffer;
 
         // Apply saved volume immediately
@@ -472,11 +1028,66 @@ fn play_station(
         pipeline.set_property("volume", saved_vol);
 
         // Start in PAUSED state for prebuffering, or PLAYING if buffer is disabled
-        let _ = pipeline.set_state(if buffer_disabled { gstreamer::State::Playing } else { gstreamer::State::Paused });
-        let bus = pipeline.bus().unwrap();
+        let initial_state = if buffer_disabled {
+            gstreamer::State::Playing
+        } else {
+            gstreamer::State::Paused
+        };
+        if let Err(err) = pipeline.set_state(initial_state) {
+            eprintln!("Failed to start playback for {}: {}", url, err);
+            let _ = pipeline.set_state(gstreamer::State::Null);
+            let failure_generation = invalidate_player(&mut player);
+            drop(player);
+            play_pause_btn.set_icon_name("media-playback-start-symbolic");
+            let scheduled = schedule_station_fallback(
+                player_lock,
+                ui_lock,
+                Some(index + 1),
+                failure_generation,
+                play_pause_btn,
+                now_playing_title,
+                now_playing_subtitle,
+                stream_meta_label,
+                stream_info_label,
+                fav_toggle_btn,
+                now_playing_flag_lbl,
+                save_mgr,
+                prefs,
+            );
+            if !scheduled {
+                stream_meta_label.set_text("(Playback unavailable)");
+            }
+            return;
+        }
+        let Some(bus) = pipeline.bus() else {
+            eprintln!("Failed to get the GStreamer bus for {}", url);
+            let _ = pipeline.set_state(gstreamer::State::Null);
+            let failure_generation = invalidate_player(&mut player);
+            drop(player);
+            play_pause_btn.set_icon_name("media-playback-start-symbolic");
+            let scheduled = schedule_station_fallback(
+                player_lock,
+                ui_lock,
+                Some(index + 1),
+                failure_generation,
+                play_pause_btn,
+                now_playing_title,
+                now_playing_subtitle,
+                stream_meta_label,
+                stream_info_label,
+                fav_toggle_btn,
+                now_playing_flag_lbl,
+                save_mgr,
+                prefs,
+            );
+            if !scheduled {
+                stream_meta_label.set_text("(Playback unavailable)");
+            }
+            return;
+        };
         let meta_rc = player.current_metadata.clone();
         let label_rc = stream_meta_label.clone();
-        
+
         let player_fallback = player_lock.clone();
         let ui_fallback = ui_lock.clone();
         let btn_fallback = play_pause_btn.clone();
@@ -489,38 +1100,92 @@ fn play_station(
         let save_mgr_fallback = save_mgr.clone();
         let prefs_fallback = prefs.clone();
         let pipeline_for_buffering = Arc::new(Mutex::new(pipeline.clone()));
+        let is_current_generation = {
+            let player_fallback = player_fallback.clone();
+            move || {
+                player_fallback
+                    .lock()
+                    .map(|player| player.generation == playback_generation)
+                    .unwrap_or(false)
+            }
+        };
 
         let guard = bus.add_watch_local(move |_, msg| {
             match msg.view() {
                 gstreamer::MessageView::Buffering(buffering_msg) => {
+                    if !is_current_generation() {
+                        return glib::ControlFlow::Break;
+                    }
                     let percent = buffering_msg.percent();
                     #[cfg(debug_assertions)]
                     eprintln!("Buffering: {}%", percent);
-                    
+
                     if buffer_disabled {
                         return glib::ControlFlow::Continue;
                     }
-                    
+
                     {
                         let mut meta = meta_rc.lock().unwrap();
                         meta.buffering_percent = Some(percent as u32);
                     }
-                    
+
                     // When buffering reaches 100%, start playback
                     if percent == 100 {
                         {
                             let mut meta = meta_rc.lock().unwrap();
                             meta.buffering_percent = None;
                         }
-                        if let Ok(pipeline) = pipeline_for_buffering.lock() {
-                            let _ = pipeline.set_state(gstreamer::State::Playing);
+                        let should_start = player_fallback
+                            .lock()
+                            .map(|player| {
+                                player.generation == playback_generation && !player.is_paused
+                            })
+                            .unwrap_or(false);
+                        if should_start {
+                            if let Ok(pipeline) = pipeline_for_buffering.lock() {
+                                if let Err(err) = pipeline.set_state(gstreamer::State::Playing) {
+                                    eprintln!("Failed to start buffered playback: {}", err);
+                                    let next_index = ui_fallback
+                                        .lock()
+                                        .ok()
+                                        .and_then(|ui| ui.current_index.map(|index| index + 1));
+                                    let failure_generation = player_fallback
+                                        .lock()
+                                        .map(|mut player| invalidate_player(&mut player))
+                                        .unwrap_or(playback_generation);
+                                    let scheduled = schedule_station_fallback(
+                                        &player_fallback,
+                                        &ui_fallback,
+                                        next_index,
+                                        failure_generation,
+                                        &btn_fallback,
+                                        &title_fallback,
+                                        &sub_fallback,
+                                        &meta_lbl_fallback,
+                                        &info_lbl_fallback,
+                                        &fav_fallback,
+                                        &flag_lbl_fallback,
+                                        &save_mgr_fallback,
+                                        &prefs_fallback,
+                                    );
+                                    if !scheduled {
+                                        btn_fallback.set_icon_name("media-playback-start-symbolic");
+                                        meta_lbl_fallback.set_text("(Playback unavailable)");
+                                        info_lbl_fallback.set_text("");
+                                    }
+                                    return glib::ControlFlow::Break;
+                                }
+                            }
                         }
                     }
                 }
                 gstreamer::MessageView::Tag(tags_msg) => {
+                    if !is_current_generation() {
+                        return glib::ControlFlow::Break;
+                    }
                     let tags = tags_msg.tags();
                     let mut meta = meta_rc.lock().unwrap();
-                    
+
                     if let Some(title) = tags.index::<gstreamer::tags::Title>(0) {
                         meta.stream_title = Some(title.get().to_string());
                     } else if let Some(artist) = tags.index::<gstreamer::tags::Artist>(0) {
@@ -537,90 +1202,126 @@ fn play_station(
                         }
                     }
 
-                    let title_str = meta.stream_title.clone().unwrap_or_else(|| "Live Stream".to_string());
+                    let title_str = meta
+                        .stream_title
+                        .clone()
+                        .unwrap_or_else(|| "Live Stream".to_string());
                     label_rc.set_text(&format!("♫ {}", title_str));
                 }
-                gstreamer::MessageView::Error(_err) => {
+                gstreamer::MessageView::Error(_) | gstreamer::MessageView::Eos(..) => {
+                    if !is_current_generation() {
+                        return glib::ControlFlow::Break;
+                    }
                     #[cfg(debug_assertions)]
-                    eprintln!("Playback Error encountered: {}. Attempting fallback track...", _err.error());
-                    
-                    let next_index = {
-                        let ui = ui_fallback.lock().unwrap();
-                        ui.current_index.map(|idx| idx + 1)
-                    };
+                    eprintln!("Playback ended or failed. Attempting fallback track...");
 
-                    if let Some(idx) = next_index {
-                        let total = {
-                            let ui = ui_fallback.lock().unwrap();
-                            let fb = ui.active_bitrate != BitrateFilterSetting::None;
-                            match ui.current_view {
-                                ViewType::Favorites => if fb { ui.stations.len() } else { ui.favorites.len() },
-                                ViewType::Recent => if fb { ui.stations.len() } else { ui.recent_stations.len() },
-                                ViewType::Playlists => if fb { ui.stations.len() } else { ui.playlists.len() },
-                                _ => ui.stations.len(),
-                            }
-                        };
-                        
-                        if idx < total {
-                            let p_rc = player_fallback.clone();
-                            let u_rc = ui_fallback.clone();
-                            let b_rc = btn_fallback.clone();
-                            let t_rc = title_fallback.clone();
-                            let s_rc = sub_fallback.clone();
-                            let m_rc = meta_lbl_fallback.clone();
-                            let i_rc = info_lbl_fallback.clone();
-                            let f_rc = fav_fallback.clone();
-                            let flag_lbl_rc = flag_lbl_fallback.clone();
-                            let save_mgr_rc = save_mgr_fallback.clone();
-                            let prefs_rc = prefs_fallback.clone();
-                            
-                            glib::idle_add_local_once(move || {
-                                play_station(&p_rc, &u_rc, idx, &b_rc, &t_rc, &s_rc, &m_rc, &i_rc, &f_rc, &flag_lbl_rc, &save_mgr_rc, &prefs_rc);
-                            });
+                    let next_index = {
+                        let player = player_fallback.lock().unwrap();
+                        let playing = player.currently_playing_station.clone();
+                        let playlist_view = player.playlist_view.clone();
+                        drop(player);
+                        let ui = ui_fallback.lock().unwrap();
+                        if playlist_view.as_ref() != Some(&ui.current_view) {
+                            None
+                        } else {
+                            playing.and_then(|station| {
+                                station_list_for_view(&ui, &ui.current_view)
+                                    .iter()
+                                    .position(|candidate| station_eq(candidate, &station))
+                                    .map(|index| index + 1)
+                            })
                         }
+                    };
+                    let fallback_generation = {
+                        let mut player = player_fallback.lock().unwrap();
+                        if player.generation != playback_generation {
+                            return glib::ControlFlow::Break;
+                        }
+                        invalidate_player(&mut player)
+                    };
+                    let scheduled = schedule_station_fallback(
+                        &player_fallback,
+                        &ui_fallback,
+                        next_index,
+                        fallback_generation,
+                        &btn_fallback,
+                        &title_fallback,
+                        &sub_fallback,
+                        &meta_lbl_fallback,
+                        &info_lbl_fallback,
+                        &fav_fallback,
+                        &flag_lbl_fallback,
+                        &save_mgr_fallback,
+                        &prefs_fallback,
+                    );
+                    if !scheduled {
+                        btn_fallback.set_icon_name("media-playback-start-symbolic");
+                        meta_lbl_fallback.set_text("(Playback ended)");
+                        info_lbl_fallback.set_text("");
                     }
                 }
                 _ => {}
             }
             glib::ControlFlow::Continue
-        }).expect("Failed to hook message bus loop watch context.");
+        });
+
+        let guard = match guard {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!("Failed to hook GStreamer bus: {}", err);
+                let _ = pipeline.set_state(gstreamer::State::Null);
+                let failure_generation = invalidate_player(&mut player);
+                drop(player);
+                play_pause_btn.set_icon_name("media-playback-start-symbolic");
+                let scheduled = schedule_station_fallback(
+                    player_lock,
+                    ui_lock,
+                    Some(index + 1),
+                    failure_generation,
+                    play_pause_btn,
+                    now_playing_title,
+                    now_playing_subtitle,
+                    stream_meta_label,
+                    stream_info_label,
+                    fav_toggle_btn,
+                    now_playing_flag_lbl,
+                    save_mgr,
+                    prefs,
+                );
+                if !scheduled {
+                    stream_meta_label.set_text("(Playback unavailable)");
+                }
+                return;
+            }
+        };
 
         player.currently_playing_station = Some(station.clone());
+        player.playlist_view = Some(playback_view);
         player.bus_guard = Some(guard);
         player.pipeline = Some(pipeline);
     } else {
         #[cfg(debug_assertions)]
         eprintln!("Failed to create pipeline for {}, skipping...", url);
-        player.currently_playing_station = None;
-        player.is_paused = false;
+        let failure_generation = invalidate_player(&mut player);
         drop(player);
         play_pause_btn.set_icon_name("media-playback-start-symbolic");
-        let next_index = index + 1;
-        let total = {
-            let ui = ui_lock.lock().unwrap();
-            let fb = ui.active_bitrate != BitrateFilterSetting::None;
-            match ui.current_view {
-                ViewType::Favorites => if fb { ui.stations.len() } else { ui.favorites.len() },
-                ViewType::Recent => if fb { ui.stations.len() } else { ui.recent_stations.len() },
-                ViewType::Playlists => if fb { ui.stations.len() } else { ui.playlists.len() },
-                _ => ui.stations.len(),
-            }
-        };
-        if next_index < total {
-            let p_rc = player_lock.clone();
-            let u_rc = ui_lock.clone();
-            let b_rc = play_pause_btn.clone();
-            let t_rc = now_playing_title.clone();
-            let s_rc = now_playing_subtitle.clone();
-            let m_rc = stream_meta_label.clone();
-            let i_rc = stream_info_label.clone();
-            let f_rc = fav_toggle_btn.clone();
-            let flag_lbl_rc = now_playing_flag_lbl.clone();
-            let save_mgr_rc = save_mgr.clone();
-            let prefs_rc = prefs.clone();
-            glib::idle_add_local_once(move || {
-                play_station(&p_rc, &u_rc, next_index, &b_rc, &t_rc, &s_rc, &m_rc, &i_rc, &f_rc, &flag_lbl_rc, &save_mgr_rc, &prefs_rc);
-            });
+        let scheduled = schedule_station_fallback(
+            player_lock,
+            ui_lock,
+            Some(index + 1),
+            failure_generation,
+            play_pause_btn,
+            now_playing_title,
+            now_playing_subtitle,
+            stream_meta_label,
+            stream_info_label,
+            fav_toggle_btn,
+            now_playing_flag_lbl,
+            save_mgr,
+            prefs,
+        );
+        if !scheduled {
+            stream_meta_label.set_text("(Playback unavailable)");
         }
     }
 }
@@ -635,9 +1336,20 @@ fn parse_m3u(content: &str) -> Vec<Station> {
                 next_name = trimmed[comma + 1..].trim().to_string();
             }
         } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if stations.len() >= MAX_PLAYLIST_STATIONS {
+                break;
+            }
+            if !is_allowed_stream_url(trimmed) {
+                next_name.clear();
+                continue;
+            }
             stations.push(Station {
                 stationuuid: String::new(),
-                name: if next_name.is_empty() { trimmed.to_string() } else { next_name.clone() },
+                name: if next_name.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    next_name.clone()
+                },
                 url_resolved: trimmed.to_string(),
                 tags: "imported".to_string(),
                 country: String::new(),
@@ -667,7 +1379,7 @@ fn parse_pls(content: &str) -> Vec<Station> {
             if upper.starts_with("FILE") {
                 let num_part = trimmed[4..eq].trim().to_string();
                 let url = trimmed[eq + 1..].trim().to_string();
-                if !url.is_empty() {
+                if is_allowed_stream_url(&url) {
                     file_map.push((num_part, url));
                 }
             } else if upper.starts_with("TITLE") {
@@ -681,6 +1393,9 @@ fn parse_pls(content: &str) -> Vec<Station> {
     }
 
     for (num, url) in file_map {
+        if stations.len() >= MAX_PLAYLIST_STATIONS {
+            break;
+        }
         let name = title_map.get(&num).cloned().unwrap_or_else(|| url.clone());
         stations.push(Station {
             stationuuid: String::new(),
@@ -697,13 +1412,17 @@ fn parse_pls(content: &str) -> Vec<Station> {
 }
 
 fn country_code_to_flag(code: &str) -> String {
-    code.chars().filter_map(|c| {
-        if c.is_ascii_alphabetic() {
-            Some(char::from_u32(0x1F1E6 + (c.to_ascii_uppercase() as u32 - 'A' as u32)).unwrap())
-        } else {
-            None
-        }
-    }).collect()
+    code.chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphabetic() {
+                Some(
+                    char::from_u32(0x1F1E6 + (c.to_ascii_uppercase() as u32 - 'A' as u32)).unwrap(),
+                )
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn format_time(duration: Duration) -> String {
@@ -711,12 +1430,152 @@ fn format_time(duration: Duration) -> String {
     format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
 }
 
-
+fn local_time_string() -> String {
+    glib::DateTime::now_local()
+        .ok()
+        .and_then(|now| now.format("%Y-%m-%d %H:%M:%S").ok())
+        .map(|formatted| formatted.to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
 
 enum IncomingData {
-    Categories(ViewType, Vec<BrowseItem>),
-    Stations(Vec<Station>, String, bool),   // String = server DB last-change time, bool = is_load_more
-    Error(String),
+    Categories {
+        request_id: u64,
+        view: ViewType,
+        items: Vec<BrowseItem>,
+    },
+    Stations {
+        request_id: u64,
+        view: ViewType,
+        stations: Vec<Station>,
+        sync_time: String,
+        is_load_more: bool,
+        limit: usize,
+        preserve_index: bool,
+        has_more_hint: bool,
+    },
+    Stats {
+        request_id: u64,
+        sync_time: String,
+    },
+    Error {
+        request_id: u64,
+        is_load_more: bool,
+        message: String,
+    },
+}
+
+impl IncomingData {
+    fn request_id(&self) -> u64 {
+        match self {
+            Self::Categories { request_id, .. }
+            | Self::Stations { request_id, .. }
+            | Self::Stats { request_id, .. }
+            | Self::Error { request_id, .. } => *request_id,
+        }
+    }
+
+    fn is_load_more(&self) -> bool {
+        matches!(
+            self,
+            Self::Stations {
+                is_load_more: true,
+                ..
+            } | Self::Error {
+                is_load_more: true,
+                ..
+            }
+        )
+    }
+
+    fn changes_list(&self) -> bool {
+        matches!(
+            self,
+            Self::Categories { .. } | Self::Stations { .. } | Self::Error { .. }
+        )
+    }
+}
+
+fn send_local_categories(
+    tx: &async_channel::Sender<IncomingData>,
+    view: ViewType,
+    items: Vec<BrowseItem>,
+) {
+    let request_id = begin_request();
+    let data = IncomingData::Categories {
+        request_id,
+        view,
+        items,
+    };
+    send_local_data(tx, data);
+}
+
+fn send_local_stations(
+    tx: &async_channel::Sender<IncomingData>,
+    view: ViewType,
+    stations: Vec<Station>,
+    sync_time: String,
+) {
+    send_local_stations_with_limit(tx, view, stations, sync_time, INITIAL_STATION_LIMIT);
+}
+
+fn send_local_stations_with_limit(
+    tx: &async_channel::Sender<IncomingData>,
+    view: ViewType,
+    stations: Vec<Station>,
+    sync_time: String,
+    limit: usize,
+) {
+    send_local_stations_with_limit_hint(tx, view, stations, sync_time, limit, false);
+}
+
+fn send_local_stations_with_limit_hint(
+    tx: &async_channel::Sender<IncomingData>,
+    view: ViewType,
+    stations: Vec<Station>,
+    sync_time: String,
+    limit: usize,
+    has_more_hint: bool,
+) {
+    let request_id = begin_request();
+    let data = IncomingData::Stations {
+        request_id,
+        view,
+        stations,
+        sync_time,
+        is_load_more: false,
+        limit: clamp_station_limit(limit),
+        preserve_index: false,
+        has_more_hint,
+    };
+    send_local_data(tx, data);
+}
+
+fn send_local_data(tx: &async_channel::Sender<IncomingData>, data: IncomingData) {
+    match tx.try_send(data) {
+        Ok(()) | Err(async_channel::TrySendError::Closed(_)) => {}
+        Err(async_channel::TrySendError::Full(data)) => {
+            let tx = tx.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let _ = tx.send(data).await;
+            });
+        }
+    }
+}
+
+async fn send_network_data(
+    tx: &async_channel::Sender<IncomingData>,
+    cancel: &mut tokio::sync::watch::Receiver<u64>,
+    request_id: u64,
+    data: IncomingData,
+) -> bool {
+    if *cancel.borrow() != request_id {
+        return false;
+    }
+    tokio::select! {
+        result = tx.send(data) => result.is_ok(),
+        _ = cancel.changed() => false,
+    }
 }
 
 /// Resolve `all.api.radio-browser.info` via DNS, reverse-lookup each IP to
@@ -732,15 +1591,18 @@ async fn resolve_radio_browser_host() -> String {
 
     use std::net::ToSocketAddrs;
 
-    let ips = tokio::task::spawn_blocking(|| {
-        ("all.api.radio-browser.info", 443u16)
-            .to_socket_addrs()
-            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
-    })
+    let ips = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(|| {
+            ("all.api.radio-browser.info", 443u16)
+                .to_socket_addrs()
+                .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
+        }),
+    )
     .await;
 
     let ips = match ips {
-        Ok(Ok(v)) if !v.is_empty() => v,
+        Ok(Ok(Ok(v))) if !v.is_empty() => v,
         _ => {
             #[cfg(debug_assertions)]
             eprintln!("🌐 Radio-Browser DNS: forward lookup failed, using de1 fallback");
@@ -748,13 +1610,15 @@ async fn resolve_radio_browser_host() -> String {
         }
     };
 
-    // Reverse-lookup each IP in parallel to get the named hostname.
+    // Reverse-lookup each IP with a bound so one unresponsive resolver cannot
+    // hold every station request indefinitely.
     let mut names: Vec<String> = Vec::new();
     for ip in &ips {
         let ip = *ip;
-        if let Ok(Ok(hostname)) = tokio::task::spawn_blocking(move || {
-            lookup_addr(&ip)
-        })
+        if let Ok(Ok(Ok(hostname))) = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || lookup_addr(&ip)),
+        )
         .await
         {
             let host = hostname.trim_end_matches('.').to_string();
@@ -766,7 +1630,9 @@ async fn resolve_radio_browser_host() -> String {
 
     if names.is_empty() {
         #[cfg(debug_assertions)]
-        eprintln!("🌐 Radio-Browser DNS: reverse lookup returned no valid names, using de1 fallback");
+        eprintln!(
+            "🌐 Radio-Browser DNS: reverse lookup returned no valid names, using de1 fallback"
+        );
         return "de1.api.radio-browser.info".to_string();
     }
 
@@ -783,7 +1649,10 @@ async fn resolve_radio_browser_host() -> String {
     let chosen = names[(h.finish() as usize) % names.len()].clone();
     let _ = CACHED_HOST.set(chosen.clone());
     #[cfg(debug_assertions)]
-    eprintln!("🌐 Radio-Browser DNS: discovered {:?}, using {}", names, chosen);
+    eprintln!(
+        "🌐 Radio-Browser DNS: discovered {:?}, using {}",
+        names, chosen
+    );
     chosen
 }
 
@@ -793,41 +1662,107 @@ fn with_host(url: &str, host: &str) -> String {
     url.replace("de1.api.radio-browser.info", host)
 }
 
+async fn response_json_limited<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, String> {
+    let response = response.error_for_status().map_err(|err| err.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_API_RESPONSE_BYTES as u64)
+    {
+        return Err("Response is too large".to_string());
+    }
+    let body = response.bytes().await.map_err(|err| err.to_string())?;
+    if body.len() > MAX_API_RESPONSE_BYTES {
+        return Err("Response is too large".to_string());
+    }
+    serde_json::from_slice(&body).map_err(|err| err.to_string())
+}
+
 fn fetch_data_async(
-    mut url: String,
+    url: String,
     is_stations: bool,
     target_view: ViewType,
     prefs: Arc<Mutex<AppPreferences>>,
     tx: async_channel::Sender<IncomingData>,
     is_load_more: bool,
 ) {
-    let client = HTTP_CLIENT.get_or_init(reqwest::Client::new).clone();
-    let rt = HTTP_RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+    fetch_data_async_internal(
+        url,
+        is_stations,
+        target_view,
+        prefs,
+        tx,
+        is_load_more,
+        false,
+    );
+}
+
+fn fetch_data_async_preserve_index(
+    url: String,
+    is_stations: bool,
+    target_view: ViewType,
+    prefs: Arc<Mutex<AppPreferences>>,
+    tx: async_channel::Sender<IncomingData>,
+    is_load_more: bool,
+) {
+    fetch_data_async_internal(url, is_stations, target_view, prefs, tx, is_load_more, true);
+}
+
+fn fetch_data_async_internal(
+    mut url: String,
+    is_stations: bool,
+    target_view: ViewType,
+    prefs: Arc<Mutex<AppPreferences>>,
+    tx: async_channel::Sender<IncomingData>,
+    is_load_more: bool,
+    preserve_index: bool,
+) {
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return;
+    }
+    let request_id = begin_request();
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return;
+    }
+    let mut cancel = request_cancel_receiver(request_id);
+    let client = HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("Failed to create HTTP client")
+        })
+        .clone();
+    let rt = HTTP_RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
     rt.spawn(async move {
         // Discover the best available server via DNS before building URLs.
-        let host = resolve_radio_browser_host().await;
+        let host = tokio::select! {
+            host = resolve_radio_browser_host() => host,
+            _ = cancel.changed() => return,
+        };
         url = with_host(&url, &host);
+
+        if !is_active_request(request_id) {
+            return;
+        }
 
         let (hide_broken, prefer_high_bitrate) = {
             let config = prefs.lock().unwrap();
             (config.hide_broken, config.prefer_high_bitrate)
         };
 
+        let target_limit = if is_load_more || preserve_index {
+            clamp_station_limit(parse_url_limit(&url).unwrap_or(INITIAL_STATION_LIMIT))
+        } else {
+            INITIAL_STATION_LIMIT
+        };
+
         if is_stations {
+            url = set_url_limit(url, target_limit);
             let sep = |u: &str| if u.contains('?') { "&" } else { "?" };
-            if !url.contains("limit=") {
-                station_limit().store(250, Ordering::Relaxed);
-            }
-            let target_limit = station_limit().load(Ordering::Relaxed);
-            if let Some(pos) = url.find("limit=") {
-                let start = pos + "limit=".len();
-                let end = url[start..].find(|c: char| !c.is_ascii_digit())
-                    .map(|i| start + i)
-                    .unwrap_or(url.len());
-                url.replace_range(start..end, &target_limit.to_string());
-            } else {
-                url.push_str(&format!("{}limit={}", sep(&url), target_limit));
-            }
             if hide_broken && !url.contains("lastcheckok=") {
                 url.push_str(&format!("{}lastcheckok=1", sep(&url)));
             }
@@ -838,69 +1773,170 @@ fn fetch_data_async(
 
         let user_agent = "RustRadio/1.0";
         if is_stations {
-            let stats_url = format!("https://{}/json/stats", host);
-            let (stations_result, stats_result) = tokio::join!(
-                client.get(&url).header("User-Agent", user_agent).send(),
-                client.get(&stats_url).header("User-Agent", user_agent).send(),
-            );
+            let stations_result = tokio::select! {
+                result = client.get(&url).header("User-Agent", user_agent).send() => result,
+                _ = cancel.changed() => return,
+            };
             match stations_result {
                 Ok(response) => {
-                    match response.json::<Vec<Station>>().await {
+                    let parsed = tokio::select! {
+                        result = response_json_limited::<Vec<Station>>(response) => result,
+                        _ = cancel.changed() => return,
+                    };
+                    match parsed {
                         Ok(stations) => {
-                            let sync_time = match stats_result {
-                                Ok(resp) => resp
-                                    .json::<RadioBrowserStats>()
-                                    .await
-                                    .map(|s| s.lastchangetime)
-                                    .unwrap_or_else(|_| "Unknown".to_string()),
-                                Err(_) => "Unknown".to_string(),
-                            };
-                            let _ = tx.send_blocking(IncomingData::Stations(
-                                stations,
-                                sync_time,
-                                is_load_more,
-                            ));
+                            let has_more_hint = stations.len() >= target_limit;
+                            let stations: Vec<Station> =
+                                stations
+                                    .into_iter()
+                                    .filter(|station| is_allowed_stream_url(&station.url_resolved))
+                                    .take(MAX_STATION_LIMIT)
+                                    .collect();
+                            if !send_network_data(
+                                &tx,
+                                &mut cancel,
+                                request_id,
+                                IncomingData::Stations {
+                                    request_id,
+                                    view: target_view.clone(),
+                                    stations,
+                                    sync_time: "Unknown".to_string(),
+                                    is_load_more,
+                                    limit: target_limit,
+                                    preserve_index,
+                                    has_more_hint,
+                                },
+                            )
+                            .await
+                            {
+                                return;
+                            }
+
+                            // The optional stats request must not delay the station list.
+                            let stats_client = client.clone();
+                            let stats_url = format!("https://{}/json/stats", host);
+                            let stats_tx = tx.clone();
+                            let mut stats_cancel = cancel.clone();
+                            tokio::spawn(async move {
+                                let stats_result = tokio::select! {
+                                    result = stats_client
+                                        .get(&stats_url)
+                                        .header("User-Agent", user_agent)
+                                        .send() => result,
+                                    _ = stats_cancel.changed() => return,
+                                };
+                                if let Ok(response) = stats_result {
+                                    let parsed = tokio::select! {
+                                        result = response_json_limited::<RadioBrowserStats>(response) => result,
+                                        _ = stats_cancel.changed() => return,
+                                    };
+                                    if let Ok(stats) = parsed
+                                    {
+                                        let _ = send_network_data(
+                                            &stats_tx,
+                                            &mut stats_cancel,
+                                            request_id,
+                                            IncomingData::Stats {
+                                                request_id,
+                                                sync_time: stats.lastchangetime,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
+                            });
                         }
                         Err(_e) => {
                             #[cfg(debug_assertions)]
                             eprintln!("Failed to parse stations JSON: {}", _e);
-                            let _ = tx.send_blocking(IncomingData::Error(
-                                "Failed to parse station list".to_string(),
-                            ));
+                            let _ = send_network_data(
+                                &tx,
+                                &mut cancel,
+                                request_id,
+                                IncomingData::Error {
+                                    request_id,
+                                    is_load_more,
+                                    message: "Failed to parse station list".to_string(),
+                                },
+                            )
+                            .await;
                         }
                     }
                 }
                 Err(_e) => {
                     #[cfg(debug_assertions)]
                     eprintln!("Failed to fetch stations: {}", _e);
-                    let _ = tx.send_blocking(IncomingData::Error(
-                        "Failed to fetch stations".to_string(),
-                    ));
+                    let _ = send_network_data(
+                        &tx,
+                        &mut cancel,
+                        request_id,
+                        IncomingData::Error {
+                            request_id,
+                            is_load_more,
+                            message: "Failed to fetch stations".to_string(),
+                        },
+                    )
+                    .await;
                 }
             }
         } else {
-            match client.get(&url).header("User-Agent", user_agent).send().await {
-                Ok(response) => {
-                    match response.json::<Vec<BrowseItem>>().await {
-                        Ok(cats) => {
-                            let filtered = cats.into_iter().filter(|c| !c.name.trim().is_empty()).take(100).collect();
-                            let _ = tx.send_blocking(IncomingData::Categories(target_view, filtered));
-                        }
-                        Err(_e) => {
-                            #[cfg(debug_assertions)]
-                            eprintln!("Failed to parse categories JSON: {}", _e);
-                            let _ = tx.send_blocking(IncomingData::Error(
-                                "Failed to parse categories".to_string(),
-                            ));
-                        }
+            let categories_result = tokio::select! {
+                result = client.get(&url).header("User-Agent", user_agent).send() => result,
+                _ = cancel.changed() => return,
+            };
+            match categories_result {
+                Ok(response) => match tokio::select! {
+                    result = response_json_limited::<Vec<BrowseItem>>(response) => result,
+                    _ = cancel.changed() => return,
+                } {
+                    Ok(cats) => {
+                        let filtered = cats
+                            .into_iter()
+                            .filter(|c| !c.name.trim().is_empty())
+                            .take(100)
+                            .collect();
+                        let _ = send_network_data(
+                            &tx,
+                            &mut cancel,
+                            request_id,
+                            IncomingData::Categories {
+                                request_id,
+                                view: target_view.clone(),
+                                items: filtered,
+                            },
+                        )
+                        .await;
                     }
-                }
+                    Err(_e) => {
+                        #[cfg(debug_assertions)]
+                        eprintln!("Failed to parse categories JSON: {}", _e);
+                        let _ = send_network_data(
+                            &tx,
+                            &mut cancel,
+                            request_id,
+                            IncomingData::Error {
+                                request_id,
+                                is_load_more: false,
+                                message: "Failed to parse categories".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                },
                 Err(_e) => {
                     #[cfg(debug_assertions)]
                     eprintln!("Failed to fetch categories: {}", _e);
-                    let _ = tx.send_blocking(IncomingData::Error(
-                        "Failed to fetch categories".to_string(),
-                    ));
+                    let _ = send_network_data(
+                        &tx,
+                        &mut cancel,
+                        request_id,
+                        IncomingData::Error {
+                            request_id,
+                            is_load_more: false,
+                            message: "Failed to fetch categories".to_string(),
+                        },
+                    )
+                    .await;
                 }
             }
         }
@@ -909,16 +1945,31 @@ fn fetch_data_async(
 
 fn build_filtered_url(category: &CategoryFilter, bitrate: BitrateFilterSetting) -> String {
     let base_endpoint = match category {
-        CategoryFilter::None => "https://de1.api.radio-browser.info/json/stations/search?".to_string(),
-        CategoryFilter::Tag(name) => format!("https://de1.api.radio-browser.info/json/stations/search?tag={}&", urlencoding::encode(name)),
-        CategoryFilter::Language(name) => format!("https://de1.api.radio-browser.info/json/stations/search?language={}&", urlencoding::encode(name)),
-        CategoryFilter::Country(name) => format!("https://de1.api.radio-browser.info/json/stations/search?country={}&", urlencoding::encode(name)),
+        CategoryFilter::None => {
+            "https://de1.api.radio-browser.info/json/stations/search?".to_string()
+        }
+        CategoryFilter::Tag(name) => format!(
+            "https://de1.api.radio-browser.info/json/stations/search?tag={}&",
+            urlencoding::encode(name)
+        ),
+        CategoryFilter::Language(name) => format!(
+            "https://de1.api.radio-browser.info/json/stations/search?language={}&",
+            urlencoding::encode(name)
+        ),
+        CategoryFilter::Country(name) => format!(
+            "https://de1.api.radio-browser.info/json/stations/search?country={}&",
+            urlencoding::encode(name)
+        ),
     };
 
     match bitrate {
         BitrateFilterSetting::None => format!("{}order=bitrate&reverse=true", base_endpoint),
-        BitrateFilterSetting::Low => format!("{}bitrateMax=160&order=bitrate&reverse=true", base_endpoint),
-        BitrateFilterSetting::High => format!("{}bitrateMin=192&order=bitrate&reverse=true", base_endpoint),
+        BitrateFilterSetting::Low => {
+            format!("{}bitrateMax=160&order=bitrate&reverse=true", base_endpoint)
+        }
+        BitrateFilterSetting::High => {
+            format!("{}bitrateMin=192&order=bitrate&reverse=true", base_endpoint)
+        }
         BitrateFilterSetting::Flac => {
             if let CategoryFilter::Tag(_) = category {
                 format!("{}bitrateMin=500&order=bitrate&reverse=true", base_endpoint)
@@ -929,7 +1980,10 @@ fn build_filtered_url(category: &CategoryFilter, bitrate: BitrateFilterSetting) 
     }
 }
 
-fn filter_stations_local(mut stations: Vec<Station>, bitrate: BitrateFilterSetting) -> Vec<Station> {
+fn filter_stations_local(
+    mut stations: Vec<Station>,
+    bitrate: BitrateFilterSetting,
+) -> Vec<Station> {
     match bitrate {
         BitrateFilterSetting::None => return stations,
         BitrateFilterSetting::Low => {
@@ -942,8 +1996,7 @@ fn filter_stations_local(mut stations: Vec<Station>, bitrate: BitrateFilterSetti
         }
         BitrateFilterSetting::Flac => {
             stations.retain(|s| {
-                s.bitrate.is_none_or(|b| b >= 500)
-                    || s.tags.to_lowercase().contains("flac")
+                s.bitrate.is_some_and(|b| b >= 500) || s.tags.to_lowercase().contains("flac")
             });
             stations.sort_by_key(|b| std::cmp::Reverse(b.bitrate.unwrap_or(0)));
         }
@@ -955,141 +2008,508 @@ fn tag_to_icon(tag: &str) -> &'static str {
     let t = tag.to_lowercase();
 
     // --- Audio quality / format ---
-    if t.contains("flac") || t.contains("lossless") || t.contains("hifi") || t.contains("hi-fi") || t.contains("audiophile") || t.contains("320") || t.contains("high quality") { return "audio-headphones-symbolic"; }
+    if t.contains("flac")
+        || t.contains("lossless")
+        || t.contains("hifi")
+        || t.contains("hi-fi")
+        || t.contains("audiophile")
+        || t.contains("320")
+        || t.contains("high quality")
+    {
+        return "audio-headphones-symbolic";
+    }
 
     // --- Genres: electronic / club ---
-    if t.contains("electron") || t.contains("techno") || t.contains("house") || t.contains("trance") || t.contains("edm") || t.contains("dance") || t.contains("dubstep") || t.contains("drum and bass") || t.contains("drum & bass") || t.contains("dnb") || t.contains("d&b") || t.contains("jungle") || t.contains("breakbeat") || t.contains("hardcore") || t.contains("rave") { return "utilities-terminal-symbolic"; }
+    if t.contains("electron")
+        || t.contains("techno")
+        || t.contains("house")
+        || t.contains("trance")
+        || t.contains("edm")
+        || t.contains("dance")
+        || t.contains("dubstep")
+        || t.contains("drum and bass")
+        || t.contains("drum & bass")
+        || t.contains("dnb")
+        || t.contains("d&b")
+        || t.contains("jungle")
+        || t.contains("breakbeat")
+        || t.contains("hardcore")
+        || t.contains("rave")
+    {
+        return "utilities-terminal-symbolic";
+    }
 
     // --- Genres: hip-hop / urban ---
-    if t.contains("hip-hop") || t.contains("hiphop") || t.contains("hip hop") || t.contains("rap") || t.contains("trap") || t.contains("grime") || t.contains("drill") { return "microphone-sensitivity-high-symbolic"; }
+    if t.contains("hip-hop")
+        || t.contains("hiphop")
+        || t.contains("hip hop")
+        || t.contains("rap")
+        || t.contains("trap")
+        || t.contains("grime")
+        || t.contains("drill")
+    {
+        return "microphone-sensitivity-high-symbolic";
+    }
 
     // --- Genres: rock / metal ---
-    if t.contains("metal") || t.contains("punk") || t.contains("grunge") || t.contains("hardcore") || t.contains("thrash") || t.contains("doom") || t.contains("black metal") || t.contains("heavy") { return "media-optical-cd-audio-symbolic"; }
-    if t.contains("rock") { return "media-optical-cd-audio-symbolic"; }
+    if t.contains("metal")
+        || t.contains("punk")
+        || t.contains("grunge")
+        || t.contains("hardcore")
+        || t.contains("thrash")
+        || t.contains("doom")
+        || t.contains("black metal")
+        || t.contains("heavy")
+    {
+        return "media-optical-cd-audio-symbolic";
+    }
+    if t.contains("rock") {
+        return "media-optical-cd-audio-symbolic";
+    }
 
     // --- Genres: classical / orchestral ---
-    if t.contains("classical") || t.contains("orchestra") || t.contains("symphony") || t.contains("opera") || t.contains("chamber") || t.contains("baroque") || t.contains("choral") || t.contains("philharmonic") { return "emblem-music-symbolic"; }
+    if t.contains("classical")
+        || t.contains("orchestra")
+        || t.contains("symphony")
+        || t.contains("opera")
+        || t.contains("chamber")
+        || t.contains("baroque")
+        || t.contains("choral")
+        || t.contains("philharmonic")
+    {
+        return "emblem-music-symbolic";
+    }
 
     // --- Genres: jazz / swing / big band ---
-    if t.contains("jazz") || t.contains("swing") || t.contains("big band") || t.contains("bebop") || t.contains("dixieland") || t.contains("blues") || t.contains("boogie") { return "audio-x-generic-symbolic"; }
+    if t.contains("jazz")
+        || t.contains("swing")
+        || t.contains("big band")
+        || t.contains("bebop")
+        || t.contains("dixieland")
+        || t.contains("blues")
+        || t.contains("boogie")
+    {
+        return "audio-x-generic-symbolic";
+    }
 
     // --- Genres: soul / R&B / funk ---
-    if t.contains("soul") || t.contains("funk") || t.contains("rnb") || t.contains("r&b") || t.contains("motown") || t.contains("gospel") || t.contains("rhythm") { return "emblem-favorite-symbolic"; }
+    if t.contains("soul")
+        || t.contains("funk")
+        || t.contains("rnb")
+        || t.contains("r&b")
+        || t.contains("motown")
+        || t.contains("gospel")
+        || t.contains("rhythm")
+    {
+        return "emblem-favorite-symbolic";
+    }
 
     // --- Genres: ambient / chill / new age ---
-    if t.contains("ambient") || t.contains("chill") || t.contains("lofi") || t.contains("lo-fi") || t.contains("relax") || t.contains("meditation") || t.contains("sleep") || t.contains("new age") || t.contains("newage") || t.contains("nature") || t.contains("spa") || t.contains("healing") { return "weather-clear-night-symbolic"; }
+    if t.contains("ambient")
+        || t.contains("chill")
+        || t.contains("lofi")
+        || t.contains("lo-fi")
+        || t.contains("relax")
+        || t.contains("meditation")
+        || t.contains("sleep")
+        || t.contains("new age")
+        || t.contains("newage")
+        || t.contains("nature")
+        || t.contains("spa")
+        || t.contains("healing")
+    {
+        return "weather-clear-night-symbolic";
+    }
 
     // --- Genres: pop ---
-    if t.contains("pop") { return "starred-symbolic"; }
+    if t.contains("pop") {
+        return "starred-symbolic";
+    }
 
     // --- Genres: country / folk ---
-    if t.contains("country") || t.contains("folk") || t.contains("bluegrass") || t.contains("acoustic") || t.contains("singer-songwriter") || t.contains("americana") { return "find-location-symbolic"; }
+    if t.contains("country")
+        || t.contains("folk")
+        || t.contains("bluegrass")
+        || t.contains("acoustic")
+        || t.contains("singer-songwriter")
+        || t.contains("americana")
+    {
+        return "find-location-symbolic";
+    }
 
     // --- Genres: Latin / tropical ---
-    if t.contains("latin") || t.contains("salsa") || t.contains("reggaeton") || t.contains("cumbia") || t.contains("bachata") || t.contains("bossa") || t.contains("samba") || t.contains("merengue") || t.contains("tango") || t.contains("flamenco") || t.contains("fado") { return "emoji-activities-symbolic"; }
+    if t.contains("latin")
+        || t.contains("salsa")
+        || t.contains("reggaeton")
+        || t.contains("cumbia")
+        || t.contains("bachata")
+        || t.contains("bossa")
+        || t.contains("samba")
+        || t.contains("merengue")
+        || t.contains("tango")
+        || t.contains("flamenco")
+        || t.contains("fado")
+    {
+        return "emoji-activities-symbolic";
+    }
 
     // --- Genres: reggae / ska ---
-    if t.contains("reggae") || t.contains("ska") || t.contains("dub") || t.contains("dancehall") { return "weather-clear-symbolic"; }
+    if t.contains("reggae") || t.contains("ska") || t.contains("dub") || t.contains("dancehall") {
+        return "weather-clear-symbolic";
+    }
 
     // --- Genres: world / cultural ---
-    if t.contains("world") || t.contains("international") || t.contains("global") || t.contains("multicultural") { return "applications-internet-symbolic"; }
+    if t.contains("world")
+        || t.contains("international")
+        || t.contains("global")
+        || t.contains("multicultural")
+    {
+        return "applications-internet-symbolic";
+    }
 
     // --- Genres: instrumental ---
-    if t.contains("instrumental") || t.contains("piano") || t.contains("guitar") || t.contains("violin") || t.contains("cello") || t.contains("trumpet") || t.contains("saxophone") || t.contains("orchestra") { return "emblem-music-symbolic"; }
+    if t.contains("instrumental")
+        || t.contains("piano")
+        || t.contains("guitar")
+        || t.contains("violin")
+        || t.contains("cello")
+        || t.contains("trumpet")
+        || t.contains("saxophone")
+        || t.contains("orchestra")
+    {
+        return "emblem-music-symbolic";
+    }
 
     // --- Talk / news / speech ---
-    if t.contains("news") || t.contains("talk") || t.contains("speech") || t.contains("podcast") || t.contains("interview") || t.contains("debate") || t.contains("current affairs") { return "dialog-information-symbolic"; }
+    if t.contains("news")
+        || t.contains("talk")
+        || t.contains("speech")
+        || t.contains("podcast")
+        || t.contains("interview")
+        || t.contains("debate")
+        || t.contains("current affairs")
+    {
+        return "dialog-information-symbolic";
+    }
 
     // --- Sports ---
-    if t.contains("sport") || t.contains("football") || t.contains("soccer") || t.contains("basketball") || t.contains("baseball") || t.contains("cricket") || t.contains("rugby") || t.contains("tennis") { return "applications-games-symbolic"; }
+    if t.contains("sport")
+        || t.contains("football")
+        || t.contains("soccer")
+        || t.contains("basketball")
+        || t.contains("baseball")
+        || t.contains("cricket")
+        || t.contains("rugby")
+        || t.contains("tennis")
+    {
+        return "applications-games-symbolic";
+    }
 
     // --- Religious ---
-    if t.contains("christian") || t.contains("gospel") || t.contains("spiritual") || t.contains("religion") || t.contains("worship") || t.contains("church") || t.contains("catholic") || t.contains("orthodox") || t.contains("islamic") || t.contains("quran") || t.contains("jewish") || t.contains("buddhist") { return "emblem-default-symbolic"; }
+    if t.contains("christian")
+        || t.contains("gospel")
+        || t.contains("spiritual")
+        || t.contains("religion")
+        || t.contains("worship")
+        || t.contains("church")
+        || t.contains("catholic")
+        || t.contains("orthodox")
+        || t.contains("islamic")
+        || t.contains("quran")
+        || t.contains("jewish")
+        || t.contains("buddhist")
+    {
+        return "emblem-default-symbolic";
+    }
 
     // --- Children / education ---
-    if t.contains("child") || t.contains("kids") || t.contains("school") || t.contains("education") || t.contains("learn") || t.contains("student") || t.contains("college") || t.contains("university") || t.contains("campus") { return "face-smile-symbolic"; }
+    if t.contains("child")
+        || t.contains("kids")
+        || t.contains("school")
+        || t.contains("education")
+        || t.contains("learn")
+        || t.contains("student")
+        || t.contains("college")
+        || t.contains("university")
+        || t.contains("campus")
+    {
+        return "face-smile-symbolic";
+    }
 
     // --- Comedy / entertainment ---
-    if t.contains("comedy") || t.contains("humor") || t.contains("humour") || t.contains("satire") { return "face-laugh-symbolic"; }
+    if t.contains("comedy") || t.contains("humor") || t.contains("humour") || t.contains("satire") {
+        return "face-laugh-symbolic";
+    }
 
     // --- Decades / era ---
-    if t.contains("50s") || t.contains("60s") || t.contains("70s") || t.contains("80s") || t.contains("90s") || t.contains("2000s") || t.contains("oldies") || t.contains("vintage") || t.contains("retro") || t.contains("golden") || t.contains("classic hits") || t.contains("throwback") { return "document-open-recent-symbolic"; }
+    if t.contains("50s")
+        || t.contains("60s")
+        || t.contains("70s")
+        || t.contains("80s")
+        || t.contains("90s")
+        || t.contains("2000s")
+        || t.contains("oldies")
+        || t.contains("vintage")
+        || t.contains("retro")
+        || t.contains("golden")
+        || t.contains("classic hits")
+        || t.contains("throwback")
+    {
+        return "document-open-recent-symbolic";
+    }
 
     // --- Indie / alternative ---
-    if t.contains("indie") || t.contains("alternative") { return "media-record-symbolic"; }
+    if t.contains("indie") || t.contains("alternative") {
+        return "media-record-symbolic";
+    }
 
     // --- Live / events ---
-    if t.contains("live") || t.contains("concert") || t.contains("festival") { return "media-record-symbolic"; }
+    if t.contains("live") || t.contains("concert") || t.contains("festival") {
+        return "media-record-symbolic";
+    }
 
     // --- Charts / variety ---
-    if t.contains("hits") || t.contains("chart") || t.contains("top 40") || t.contains("variety") || t.contains("mix") { return "view-list-symbolic"; }
+    if t.contains("hits")
+        || t.contains("chart")
+        || t.contains("top 40")
+        || t.contains("variety")
+        || t.contains("mix")
+    {
+        return "view-list-symbolic";
+    }
 
     // --- Seasonal ---
-    if t.contains("christmas") || t.contains("holiday") || t.contains("seasonal") || t.contains("xmas") { return "starred-symbolic"; }
+    if t.contains("christmas")
+        || t.contains("holiday")
+        || t.contains("seasonal")
+        || t.contains("xmas")
+    {
+        return "starred-symbolic";
+    }
 
     // --- Regional: East Asian ---
-    if t.contains("japanese") || t.contains("j-pop") || t.contains("j-rock") || t.contains("anime") { return "applications-internet-symbolic"; }
-    if t.contains("korean") || t.contains("k-pop") || t.contains("k-drama") { return "applications-internet-symbolic"; }
-    if t.contains("chinese") || t.contains("mandarin") || t.contains("cantonese") || t.contains("taiwanese") { return "applications-internet-symbolic"; }
+    if t.contains("japanese") || t.contains("j-pop") || t.contains("j-rock") || t.contains("anime")
+    {
+        return "applications-internet-symbolic";
+    }
+    if t.contains("korean") || t.contains("k-pop") || t.contains("k-drama") {
+        return "applications-internet-symbolic";
+    }
+    if t.contains("chinese")
+        || t.contains("mandarin")
+        || t.contains("cantonese")
+        || t.contains("taiwanese")
+    {
+        return "applications-internet-symbolic";
+    }
 
     // --- Regional: South / Southeast Asian ---
-    if t.contains("indian") || t.contains("hindi") || t.contains("bollywood") || t.contains("bhangra") || t.contains("carnatic") || t.contains("filmi") { return "emoji-activities-symbolic"; }
-    if t.contains("bengali") || t.contains("tamil") || t.contains("telugu") || t.contains("malayalam") || t.contains("punjabi") { return "emoji-activities-symbolic"; }
-    if t.contains("thai") || t.contains("vietnamese") || t.contains("indonesian") || t.contains("philippine") || t.contains("malay") { return "emoji-activities-symbolic"; }
+    if t.contains("indian")
+        || t.contains("hindi")
+        || t.contains("bollywood")
+        || t.contains("bhangra")
+        || t.contains("carnatic")
+        || t.contains("filmi")
+    {
+        return "emoji-activities-symbolic";
+    }
+    if t.contains("bengali")
+        || t.contains("tamil")
+        || t.contains("telugu")
+        || t.contains("malayalam")
+        || t.contains("punjabi")
+    {
+        return "emoji-activities-symbolic";
+    }
+    if t.contains("thai")
+        || t.contains("vietnamese")
+        || t.contains("indonesian")
+        || t.contains("philippine")
+        || t.contains("malay")
+    {
+        return "emoji-activities-symbolic";
+    }
 
     // --- Regional: Middle Eastern ---
-    if t.contains("arabic") || t.contains("arab") || t.contains("khaleeji") || t.contains("middle east") || t.contains("levant") { return "weather-clear-symbolic"; }
-    if t.contains("persian") || t.contains("farsi") || t.contains("iranian") { return "weather-clear-symbolic"; }
-    if t.contains("turkish") || t.contains("turk") { return "weather-clear-symbolic"; }
-    if t.contains("kurdish") { return "weather-clear-symbolic"; }
+    if t.contains("arabic")
+        || t.contains("arab")
+        || t.contains("khaleeji")
+        || t.contains("middle east")
+        || t.contains("levant")
+    {
+        return "weather-clear-symbolic";
+    }
+    if t.contains("persian") || t.contains("farsi") || t.contains("iranian") {
+        return "weather-clear-symbolic";
+    }
+    if t.contains("turkish") || t.contains("turk") {
+        return "weather-clear-symbolic";
+    }
+    if t.contains("kurdish") {
+        return "weather-clear-symbolic";
+    }
 
     // --- Regional: African ---
-    if t.contains("african") || t.contains("afro") || t.contains("afrobeat") || t.contains("afropop") || t.contains("highlife") || t.contains("juju") || t.contains("mbalax") { return "find-location-symbolic"; }
+    if t.contains("african")
+        || t.contains("afro")
+        || t.contains("afrobeat")
+        || t.contains("afropop")
+        || t.contains("highlife")
+        || t.contains("juju")
+        || t.contains("mbalax")
+    {
+        return "find-location-symbolic";
+    }
 
     // --- Regional: Eastern European / Slavic ---
-    if t.contains("russian") || t.contains("ukraine") || t.contains("ukrainian") || t.contains("polish") || t.contains("czech") || t.contains("slovak") || t.contains("balkan") || t.contains("serbian") || t.contains("croatian") || t.contains("bulgarian") || t.contains("romanian") { return "emblem-music-symbolic"; }
+    if t.contains("russian")
+        || t.contains("ukraine")
+        || t.contains("ukrainian")
+        || t.contains("polish")
+        || t.contains("czech")
+        || t.contains("slovak")
+        || t.contains("balkan")
+        || t.contains("serbian")
+        || t.contains("croatian")
+        || t.contains("bulgarian")
+        || t.contains("romanian")
+    {
+        return "emblem-music-symbolic";
+    }
 
     // --- Regional: Western / Northern European ---
-    if t.contains("french") || t.contains("chanson") { return "emblem-favorite-symbolic"; }
-    if t.contains("german") || t.contains("deutsch") || t.contains("schlager") || t.contains("volksmusik") { return "emblem-music-symbolic"; }
-    if t.contains("spanish") || t.contains("espanol") { return "emoji-activities-symbolic"; }
-    if t.contains("italian") || t.contains("italiano") || t.contains("cantautore") { return "emblem-favorite-symbolic"; }
-    if t.contains("greek") || t.contains("laika") || t.contains("rebetiko") { return "weather-clear-symbolic"; }
-    if t.contains("celtic") || t.contains("irish") || t.contains("scottish") || t.contains("welsh") || t.contains("breton") { return "find-location-symbolic"; }
-    if t.contains("nordic") || t.contains("scandinavian") || t.contains("swedish") || t.contains("norwegian") || t.contains("danish") || t.contains("finnish") { return "weather-clear-night-symbolic"; }
+    if t.contains("french") || t.contains("chanson") {
+        return "emblem-favorite-symbolic";
+    }
+    if t.contains("german")
+        || t.contains("deutsch")
+        || t.contains("schlager")
+        || t.contains("volksmusik")
+    {
+        return "emblem-music-symbolic";
+    }
+    if t.contains("spanish") || t.contains("espanol") {
+        return "emoji-activities-symbolic";
+    }
+    if t.contains("italian") || t.contains("italiano") || t.contains("cantautore") {
+        return "emblem-favorite-symbolic";
+    }
+    if t.contains("greek") || t.contains("laika") || t.contains("rebetiko") {
+        return "weather-clear-symbolic";
+    }
+    if t.contains("celtic")
+        || t.contains("irish")
+        || t.contains("scottish")
+        || t.contains("welsh")
+        || t.contains("breton")
+    {
+        return "find-location-symbolic";
+    }
+    if t.contains("nordic")
+        || t.contains("scandinavian")
+        || t.contains("swedish")
+        || t.contains("norwegian")
+        || t.contains("danish")
+        || t.contains("finnish")
+    {
+        return "weather-clear-night-symbolic";
+    }
 
     // --- Missing genre gaps ---
-    if t.contains("soundtrack") || t.contains("film") || t.contains("movie") || t.contains("cinema") || t.contains("score") { return "video-display-symbolic"; }
-    if t.contains("industrial") || t.contains("noise") { return "utilities-terminal-symbolic"; }
-    if t.contains("new wave") || t.contains("post-punk") || t.contains("prog") || t.contains("progressive") { return "media-record-symbolic"; }
-    if t.contains("lounge") || t.contains("easy listening") || t.contains("beautiful music") || t.contains("adult contemporary") { return "starred-symbolic"; }
-    if t.contains("roots") { return "find-location-symbolic"; }
-    if t.contains("jazz fusion") { return "audio-x-generic-symbolic"; }
-    if t.contains("trip-hop") || t.contains("triphop") || t.contains("downtempo") || t.contains("down tempo") { return "weather-clear-night-symbolic"; }
-    if t.contains("a cappella") || t.contains("acappella") || t.contains("vocal") || t.contains("choir") { return "audio-input-microphone-symbolic"; }
-    if t.contains("karaoke") || t.contains("instrumentals") { return "media-record-symbolic"; }
-    if t.contains("audiobook") || t.contains("audio book") || t.contains("audio drama") { return "dialog-information-symbolic"; }
-    if t.contains("public") || t.contains("npr") || t.contains("community") || t.contains("traffic") || t.contains("weather") || t.contains("emergency") { return "dialog-information-symbolic"; }
-    if t.contains("top") || t.contains("greatest") || t.contains("request") || t.contains("today") { return "starred-symbolic"; }
-    if t.contains("urban") || t.contains("contemporary") { return "emblem-favorite-symbolic"; }
-    if t.contains("political") || t.contains("politics") || t.contains("government") { return "dialog-information-symbolic"; }
+    if t.contains("soundtrack")
+        || t.contains("film")
+        || t.contains("movie")
+        || t.contains("cinema")
+        || t.contains("score")
+    {
+        return "video-display-symbolic";
+    }
+    if t.contains("industrial") || t.contains("noise") {
+        return "utilities-terminal-symbolic";
+    }
+    if t.contains("new wave")
+        || t.contains("post-punk")
+        || t.contains("prog")
+        || t.contains("progressive")
+    {
+        return "media-record-symbolic";
+    }
+    if t.contains("lounge")
+        || t.contains("easy listening")
+        || t.contains("beautiful music")
+        || t.contains("adult contemporary")
+    {
+        return "starred-symbolic";
+    }
+    if t.contains("roots") {
+        return "find-location-symbolic";
+    }
+    if t.contains("jazz fusion") {
+        return "audio-x-generic-symbolic";
+    }
+    if t.contains("trip-hop")
+        || t.contains("triphop")
+        || t.contains("downtempo")
+        || t.contains("down tempo")
+    {
+        return "weather-clear-night-symbolic";
+    }
+    if t.contains("a cappella")
+        || t.contains("acappella")
+        || t.contains("vocal")
+        || t.contains("choir")
+    {
+        return "audio-input-microphone-symbolic";
+    }
+    if t.contains("karaoke") || t.contains("instrumentals") {
+        return "media-record-symbolic";
+    }
+    if t.contains("audiobook") || t.contains("audio book") || t.contains("audio drama") {
+        return "dialog-information-symbolic";
+    }
+    if t.contains("public")
+        || t.contains("npr")
+        || t.contains("community")
+        || t.contains("traffic")
+        || t.contains("weather")
+        || t.contains("emergency")
+    {
+        return "dialog-information-symbolic";
+    }
+    if t.contains("top") || t.contains("greatest") || t.contains("request") || t.contains("today") {
+        return "starred-symbolic";
+    }
+    if t.contains("urban") || t.contains("contemporary") {
+        return "emblem-favorite-symbolic";
+    }
+    if t.contains("political") || t.contains("politics") || t.contains("government") {
+        return "dialog-information-symbolic";
+    }
 
     // --- General music / radio (last resort before fallback) ---
-    if t.contains("music") || t.contains("musica") || t.contains("musik") { return "audio-x-generic-symbolic"; }
-    if t.contains("radio") || t.contains("broadcast") || t.contains("stream") { return "audio-input-microphone-symbolic"; }
+    if t.contains("music") || t.contains("musica") || t.contains("musik") {
+        return "audio-x-generic-symbolic";
+    }
+    if t.contains("radio") || t.contains("broadcast") || t.contains("stream") {
+        return "audio-input-microphone-symbolic";
+    }
 
     "audio-x-generic-symbolic"
 }
 
 fn build_ui(app: &Application) {
+    SHUTTING_DOWN.store(false, Ordering::Release);
     adw::init().unwrap();
 
     let provider = gtk::CssProvider::new();
-    provider.load_from_data("
+    provider.load_from_data(
+        "
         list row:selected { background-color: alpha(currentColor, 0.12); }
-    ");
+    ",
+    );
     gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().expect("Could not connect to system display context tracker."),
+        &gtk::gdk::Display::default()
+            .expect("Could not connect to system display context tracker."),
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
@@ -1097,10 +2517,25 @@ fn build_ui(app: &Application) {
     // --- REHYDRATE FROM DISK ---
     let saved_data = AppState::load_data();
 
-    let current_metadata = Arc::new(Mutex::new(AudioMetadata { bitrate: None, sample_rate: None, stream_title: None, codec: None, bit_depth: None, buffering_percent: None }));
-    let player_state = Arc::new(Mutex::new(PlayerState { pipeline: None, bus_guard: None, is_paused: false, current_metadata, currently_playing_station: None }));
-    
-    let app_prefs = Arc::new(Mutex::new(AppPreferences { 
+    let current_metadata = Arc::new(Mutex::new(AudioMetadata {
+        bitrate: None,
+        sample_rate: None,
+        stream_title: None,
+        codec: None,
+        bit_depth: None,
+        buffering_percent: None,
+    }));
+    let player_state = Arc::new(Mutex::new(PlayerState {
+        pipeline: None,
+        bus_guard: None,
+        generation: 0,
+        is_paused: false,
+        current_metadata,
+        currently_playing_station: None,
+        playlist_view: None,
+    }));
+
+    let app_prefs = Arc::new(Mutex::new(AppPreferences {
         prefer_high_bitrate: saved_data.prefer_high_bitrate,
         hide_broken: saved_data.hide_broken,
         auto_update: saved_data.auto_update,
@@ -1116,7 +2551,7 @@ fn build_ui(app: &Application) {
         disable_audio_buffer: saved_data.disable_audio_buffer,
         volume: saved_data.volume,
     }));
-    
+
     let last_sync_ts = if saved_data.last_sync_timestamp.is_empty() {
         "Never Gathered".to_string()
     } else {
@@ -1144,34 +2579,47 @@ fn build_ui(app: &Application) {
         last_update_timestamp: last_sync_ts.clone(),
         total_elements_fetched: saved_data.last_stations_loaded,
         last_stations_updated_count: saved_data.last_stations_loaded,
+        station_limit: INITIAL_STATION_LIMIT,
+        station_has_more_hint: false,
         cached_tags: None,
         cached_languages: None,
         cached_countries: None,
     }));
 
-    let app_state_manager = Arc::new(AppState { ui: ui_state.clone(), prefs: app_prefs.clone() });
+    let app_state_manager = Arc::new(AppState {
+        ui: ui_state.clone(),
+        prefs: app_prefs.clone(),
+    });
 
     let content_box = Box::new(Orientation::Vertical, 0);
 
     // --- Header Bar & Context Menus ---
     let header_bar = HeaderBar::new();
-    let menu_btn = MenuButton::builder().icon_name("open-menu-symbolic").build();
+    let menu_btn = MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .build();
     let menu_popover = Popover::new();
     let menu_box = Box::new(Orientation::Vertical, 6);
-    
-    let settings_btn = Button::builder().label("Preferences").has_frame(false).build();
+
+    let settings_btn = Button::builder()
+        .label("Preferences")
+        .has_frame(false)
+        .build();
     menu_box.append(&settings_btn);
     menu_popover.set_child(Some(&menu_box));
     menu_btn.set_popover(Some(&menu_popover));
-    
+
     // Search entry removed from headerbar and built for the main view
     let search_entry = SearchEntry::builder()
         .placeholder_text("Search stations…")
         .width_request(300)
-        .margin_start(16).margin_end(16).margin_top(8).margin_bottom(4)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(8)
+        .margin_bottom(4)
         .build();
     search_entry.set_tooltip_text(Some("Search global radio stations"));
-    
+
     header_bar.pack_end(&menu_btn);
     content_box.append(&header_bar);
 
@@ -1243,7 +2691,7 @@ fn build_ui(app: &Application) {
         .orientation(Orientation::Vertical)
         .hexpand(true)
         .build();
-        
+
     let sidebar_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -1265,21 +2713,28 @@ fn build_ui(app: &Application) {
 
     // --- Filter Shelves (compact icon buttons) ---
     let filter_shelf = Box::builder()
-        .orientation(Orientation::Vertical).spacing(0)
-        .margin_bottom(6).margin_top(6).margin_start(12).margin_end(12)
+        .orientation(Orientation::Vertical)
+        .spacing(0)
+        .margin_bottom(6)
+        .margin_top(6)
+        .margin_start(12)
+        .margin_end(12)
         .build();
 
     let row2_category_box = Box::builder()
-        .orientation(Orientation::Horizontal).spacing(12)
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
         .halign(gtk::Align::Fill)
         .build();
 
     let sort_area = Box::builder()
-        .orientation(Orientation::Vertical).spacing(0)
+        .orientation(Orientation::Vertical)
+        .spacing(0)
         .halign(gtk::Align::Start)
         .build();
     let sort_row = Box::builder()
-        .orientation(Orientation::Horizontal).spacing(4)
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
         .halign(gtk::Align::Start)
         .build();
     let sort_desc = Label::builder()
@@ -1289,18 +2744,29 @@ fn build_ui(app: &Application) {
     sort_row.append(&sort_desc);
 
     let make_sort_btn = |icon: &str, label: &str| -> Button {
-        let hbox = Box::builder().orientation(Orientation::Horizontal).spacing(4).build();
+        let hbox = Box::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(4)
+            .build();
         let img = gtk::Image::from_icon_name(icon);
         img.set_icon_size(gtk::IconSize::Inherit);
-        let lbl = Label::builder().label(label).css_classes(vec!["caption".to_string()]).build();
-        hbox.append(&img); hbox.append(&lbl);
-        Button::builder().child(&hbox).css_classes(vec!["flat".to_string()]).build()
+        let lbl = Label::builder()
+            .label(label)
+            .css_classes(vec!["caption".to_string()])
+            .build();
+        hbox.append(&img);
+        hbox.append(&lbl);
+        Button::builder()
+            .child(&hbox)
+            .css_classes(vec!["flat".to_string()])
+            .build()
     };
-    let sort_abc_btn   = make_sort_btn("format-justify-left-symbolic", "A–Z");
+    let sort_abc_btn = make_sort_btn("format-justify-left-symbolic", "A–Z");
     sort_row.append(&sort_abc_btn);
 
     let br_area = Box::builder()
-        .orientation(Orientation::Horizontal).spacing(4)
+        .orientation(Orientation::Horizontal)
+        .spacing(4)
         .halign(gtk::Align::Start)
         .build();
     let br_desc = Label::builder()
@@ -1312,7 +2778,7 @@ fn build_ui(app: &Application) {
     let bitrate_menu_btn = MenuButton::builder()
         .label(match ui_state.lock().unwrap().active_bitrate {
             BitrateFilterSetting::None => "⊟ Bitrate",
-            BitrateFilterSetting::Low  => "⊟ Low ≤160",
+            BitrateFilterSetting::Low => "⊟ Low ≤160",
             BitrateFilterSetting::High => "⊟ High ≥192",
             BitrateFilterSetting::Flac => "⊟ FLAC",
         })
@@ -1322,10 +2788,22 @@ fn build_ui(app: &Application) {
 
     let bitrate_popover = Popover::new();
     let bitrate_options_box = Box::new(Orientation::Vertical, 4);
-    let any_br_btn  = Button::builder().label("Any Bitrate").has_frame(false).build();
-    let low_br_btn  = Button::builder().label("Low (≤160 kbps)").has_frame(false).build();
-    let high_br_btn = Button::builder().label("High (≥192 kbps)").has_frame(false).build();
-    let flac_br_btn = Button::builder().label("Flac (Lossless)").has_frame(false).build();
+    let any_br_btn = Button::builder()
+        .label("Any Bitrate")
+        .has_frame(false)
+        .build();
+    let low_br_btn = Button::builder()
+        .label("Low (≤160 kbps)")
+        .has_frame(false)
+        .build();
+    let high_br_btn = Button::builder()
+        .label("High (≥192 kbps)")
+        .has_frame(false)
+        .build();
+    let flac_br_btn = Button::builder()
+        .label("Flac (Lossless)")
+        .has_frame(false)
+        .build();
     bitrate_options_box.append(&any_br_btn);
     bitrate_options_box.append(&low_br_btn);
     bitrate_options_box.append(&high_br_btn);
@@ -1334,7 +2812,8 @@ fn build_ui(app: &Application) {
     bitrate_menu_btn.set_popover(Some(&bitrate_popover));
 
     let combined_row = Box::builder()
-        .orientation(Orientation::Horizontal).spacing(12)
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
         .halign(gtk::Align::Start)
         .build();
     combined_row.append(&sort_row);
@@ -1346,8 +2825,12 @@ fn build_ui(app: &Application) {
     row2_category_box.append(&sort_area);
 
     let header_search = Box::builder()
-        .orientation(Orientation::Horizontal).spacing(8)
-        .margin_start(12).margin_end(12).margin_top(6).margin_bottom(4)
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(4)
         .halign(gtk::Align::Start)
         .build();
     header_search.append(&search_entry);
@@ -1379,19 +2862,27 @@ fn build_ui(app: &Application) {
     right_content.append(&filter_shelf);
 
     let counter_panel = Box::builder()
-        .orientation(Orientation::Horizontal).spacing(12)
-        .halign(gtk::Align::End).margin_end(10)
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .halign(gtk::Align::End)
+        .margin_end(10)
         .build();
-    
-    let stations_count_label = Label::builder().label("0 entries displayed").css_classes(vec!["caption".to_string(), "dim-label".to_string()]).build();
-    let last_updated_label = Label::builder().label("Last update: Never").css_classes(vec!["caption".to_string(), "dim-label".to_string()]).build();
+
+    let stations_count_label = Label::builder()
+        .label("0 entries displayed")
+        .css_classes(vec!["caption".to_string(), "dim-label".to_string()])
+        .build();
+    let last_updated_label = Label::builder()
+        .label("Last update: Never")
+        .css_classes(vec!["caption".to_string(), "dim-label".to_string()])
+        .build();
     {
         let u = ui_state.lock().unwrap();
         if u.last_update_timestamp != "Never Gathered" {
             last_updated_label.set_text(&format!("DB synced: {}", u.last_update_timestamp));
         }
     }
-    
+
     counter_panel.append(&stations_count_label);
     counter_panel.append(&last_updated_label);
 
@@ -1404,28 +2895,44 @@ fn build_ui(app: &Application) {
         .build();
 
     let browsing_row = Box::builder()
-        .orientation(Orientation::Horizontal).spacing(12)
-        .margin_top(4).margin_bottom(2)
+        .orientation(Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(4)
+        .margin_bottom(2)
         .build();
     browsing_row.append(&now_browsing_label);
     browsing_row.append(&counter_panel);
     right_content.append(&browsing_row);
 
     let list_box = ListBox::builder()
-        .margin_top(6).margin_bottom(12).margin_start(12).margin_end(12)
+        .margin_top(6)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
         .css_classes(vec!["boxed-list".to_string()])
         .build();
 
     let scrolled_window = ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never).vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true).child(&list_box)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&list_box)
         .build();
 
     right_content.append(&scrolled_window);
 
-    let prev_btn = Button::builder().icon_name("media-skip-backward-symbolic").css_classes(vec!["circular".to_string()]).build();
-    let play_pause_btn = Button::builder().icon_name("media-playback-start-symbolic").css_classes(vec!["circular".to_string(), "suggested-action".to_string()]).build();
-    let next_btn = Button::builder().icon_name("media-skip-forward-symbolic").css_classes(vec!["circular".to_string()]).build();
+    let prev_btn = Button::builder()
+        .icon_name("media-skip-backward-symbolic")
+        .css_classes(vec!["circular".to_string()])
+        .build();
+    let play_pause_btn = Button::builder()
+        .icon_name("media-playback-start-symbolic")
+        .css_classes(vec!["circular".to_string(), "suggested-action".to_string()])
+        .build();
+    let next_btn = Button::builder()
+        .icon_name("media-skip-forward-symbolic")
+        .css_classes(vec!["circular".to_string()])
+        .build();
 
     let now_playing_title = Label::builder()
         .label("No Station Selected")
@@ -1456,7 +2963,11 @@ fn build_ui(app: &Application) {
         .build();
     let time_label = Label::builder()
         .label("0:00")
-        .css_classes(vec!["title-2".to_string(), "numeric".to_string(), "dim-label".to_string()])
+        .css_classes(vec![
+            "title-2".to_string(),
+            "numeric".to_string(),
+            "dim-label".to_string(),
+        ])
         .valign(gtk::Align::Center)
         .halign(gtk::Align::Start)
         .build();
@@ -1483,10 +2994,15 @@ fn build_ui(app: &Application) {
         let current_pref = app_prefs_render.lock().unwrap();
 
         let ctx = widget.style_context();
-        let accent = ctx.lookup_color("accent_bg_color")
+        let accent = ctx
+            .lookup_color("accent_bg_color")
             .or_else(|| ctx.lookup_color("theme_selected_bg_color"))
             .unwrap_or(gtk::gdk::RGBA::new(0.2, 0.44, 0.85, 0.95));
-        let (ar, ag, ab) = (accent.red() as f64, accent.green() as f64, accent.blue() as f64);
+        let (ar, ag, ab) = (
+            accent.red() as f64,
+            accent.green() as f64,
+            accent.blue() as f64,
+        );
         cr.set_source_rgba(ar, ag, ab, 0.95);
         let accent_dim = gtk::gdk::RGBA::new(accent.red(), accent.green(), accent.blue(), 0.40);
 
@@ -1501,8 +3017,20 @@ fn build_ui(app: &Application) {
                     let y = (height as f64 - bar_h) / 2.0;
 
                     cr.new_sub_path();
-                    cr.arc(x + bar_width / 2.0, y, bar_width / 2.0, std::f64::consts::PI, 0.0);
-                    cr.arc(x + bar_width / 2.0, y + bar_h, bar_width / 2.0, 0.0, std::f64::consts::PI);
+                    cr.arc(
+                        x + bar_width / 2.0,
+                        y,
+                        bar_width / 2.0,
+                        std::f64::consts::PI,
+                        0.0,
+                    );
+                    cr.arc(
+                        x + bar_width / 2.0,
+                        y + bar_h,
+                        bar_width / 2.0,
+                        0.0,
+                        std::f64::consts::PI,
+                    );
                     cr.close_path();
                     let _ = cr.fill();
                 }
@@ -1523,10 +3051,14 @@ fn build_ui(app: &Application) {
                 let dot_height = 2.0;
                 let dot_gap = 1.0;
                 let max_dots = (height as f64 / (dot_height + dot_gap)) as usize;
+                if max_dots == 0 {
+                    return;
+                }
 
                 for (i, &val) in bars.iter().enumerate() {
                     let x = i as f64 * (bar_width + spacing);
-                    let active_dots = (((val / 50.0) * height as f64) / (dot_height + dot_gap)) as usize;
+                    let active_dots =
+                        (((val / 50.0) * height as f64) / (dot_height + dot_gap)) as usize;
                     let active_dots = active_dots.min(max_dots).max(1);
 
                     for j in 0..active_dots {
@@ -1535,11 +3067,17 @@ fn build_ui(app: &Application) {
                         let _ = cr.fill();
                     }
 
-                    let peak_dot_idx = (((peaks[i] / 50.0) * height as f64) / (dot_height + dot_gap)) as usize;
+                    let peak_dot_idx =
+                        (((peaks[i] / 50.0) * height as f64) / (dot_height + dot_gap)) as usize;
                     let peak_dot_idx = peak_dot_idx.min(max_dots - 1);
-                    let p_y = height as f64 - (peak_dot_idx as f64 * (dot_height + dot_gap)) - dot_height;
-                    
-                    let (adr, adg, adb) = (accent_dim.red() as f64, accent_dim.green() as f64, accent_dim.blue() as f64);
+                    let p_y =
+                        height as f64 - (peak_dot_idx as f64 * (dot_height + dot_gap)) - dot_height;
+
+                    let (adr, adg, adb) = (
+                        accent_dim.red() as f64,
+                        accent_dim.green() as f64,
+                        accent_dim.blue() as f64,
+                    );
                     let ada = accent_dim.alpha() as f64;
                     cr.set_source_rgba(adr, adg, adb, ada);
                     cr.rectangle(x, p_y, bar_width, dot_height);
@@ -1552,10 +3090,14 @@ fn build_ui(app: &Application) {
                 let dot_height = 2.0;
                 let dot_gap = 1.0;
                 let max_dots = (height as f64 / (dot_height + dot_gap)) as usize;
+                if max_dots == 0 {
+                    return;
+                }
 
                 for (i, &val) in bars.iter().enumerate() {
                     let x = i as f64 * (bar_width + spacing);
-                    let active_dots = (((val / 50.0) * height as f64) / (dot_height + dot_gap)) as usize;
+                    let active_dots =
+                        (((val / 50.0) * height as f64) / (dot_height + dot_gap)) as usize;
                     let active_dots = active_dots.min(max_dots).max(1);
 
                     for j in 0..active_dots {
@@ -1574,7 +3116,8 @@ fn build_ui(app: &Application) {
     let bottom_bar = Box::builder()
         .orientation(Orientation::Horizontal)
         .spacing(0)
-        .margin_top(0).margin_bottom(0)
+        .margin_top(0)
+        .margin_bottom(0)
         .height_request(88)
         .hexpand(true)
         .build();
@@ -1666,10 +3209,10 @@ fn build_ui(app: &Application) {
     now_playing_right.append(&drawing_analyzer);
     centre_box.set_end_widget(Some(&now_playing_right));
 
-    let (tx, rx) = async_channel::unbounded::<IncomingData>();
+    let (tx, rx) = async_channel::bounded::<IncomingData>(64);
 
     let window_parent_hook = content_box.clone();
-     let prefs_window_ref = app_prefs.clone();
+    let prefs_window_ref = app_prefs.clone();
     let ui_telemetry_ref = ui_state.clone();
     let tx_sync_prefs = tx.clone();
     let prefs_sync_prefs = app_prefs.clone();
@@ -1680,6 +3223,8 @@ fn build_ui(app: &Application) {
     let ui_restore_ref = ui_state.clone();
     let prefs_restore_ref = app_prefs.clone();
     let app_state_restore_ref = app_state_manager.clone();
+    let tx_restore_ref = tx.clone();
+    let custom_tags_restore_ref = custom_tag_buttons_box.clone();
     let app_state_prefs_close_ref = app_state_manager.clone();
     let stats_label_holder = make_stats_label();
     let stats_label_btn = stats_label_holder.clone();
@@ -1726,11 +3271,31 @@ fn build_ui(app: &Application) {
         sync_btn.connect_clicked(move |_| {
             sync_lbl.set_text("Syncing...");
             let mut ui = sync_ui.lock().unwrap();
+            let view = ui.current_view.clone();
+            if matches!(view, ViewType::Favorites | ViewType::Recent | ViewType::Playlists) {
+                let stations = match view {
+                    ViewType::Favorites => ui.favorites.clone(),
+                    ViewType::Recent => ui.recent_stations.clone(),
+                    ViewType::Playlists => ui.playlists.clone(),
+                    _ => unreachable!(),
+                };
+                let stations = filter_stations_local(stations, ui.active_bitrate);
+                drop(ui);
+                sync_lbl.set_text("Local list refreshed");
+                send_local_stations(&sync_tx, view, stations, String::new());
+                return;
+            }
             let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
             ui.last_fetched_url = url.clone();
-            let view = ui.current_view.clone();
             drop(ui);
-            fetch_data_async(url, true, view, sync_prefs.clone(), sync_tx.clone(), false);
+            fetch_data_async(
+                url,
+                true,
+                station_response_view(&view),
+                sync_prefs.clone(),
+                sync_tx.clone(),
+                false,
+            );
         });
         sync_row.add_suffix(&sync_btn);
 
@@ -1998,7 +3563,15 @@ fn build_ui(app: &Application) {
                     let ui  = ui_exp.lock().unwrap();
                     let prf = prefs_exp.lock().unwrap();
                     let payload = BackupPayload {
-                        home_tags:   if chk_ht.is_active() { Some(ui.categories.iter().map(|c| c.name.clone()).collect()) } else { None },
+                        home_tags:   if chk_ht.is_active() {
+                            Some(ui.cached_tags.clone().unwrap_or_else(|| {
+                                if matches!(ui.current_view, ViewType::Tags) {
+                                    ui.categories.clone()
+                                } else {
+                                    Vec::new()
+                                }
+                            }).into_iter().map(|c| c.name).collect())
+                        } else { None },
                         favourites:  if chk_fv.is_active() { Some(ui.favorites.clone()) } else { None },
                         playlists:   if chk_pl.is_active() { Some(ui.playlists.clone()) } else { None },
                         custom_tags: if chk_ct.is_active() { Some(prf.custom_tags.clone()) } else { None },
@@ -2048,6 +3621,8 @@ fn build_ui(app: &Application) {
             let prefs_rs = prefs_restore_ref.clone();
             let save_rs = app_state_restore_ref.clone();
             let prefs_win_rs = prefs_window.clone();
+            let tx_restore_button = tx_restore_ref.clone();
+            let custom_tags_restore_button = custom_tags_restore_ref.clone();
             restore_btn.connect_clicked(move |_| {
                 let ui_rs2    = ui_rs.clone();
                 let prefs_rs2 = prefs_rs.clone();
@@ -2063,11 +3638,19 @@ fn build_ui(app: &Application) {
                 filter.add_pattern("*.json");
                 filter.set_name(Some("JSON files"));
                 chooser.add_filter(&filter);
+                let tx_restore = tx_restore_button.clone();
+                let custom_tags_restore = custom_tags_restore_button.clone();
                 chooser.connect_response(move |dlg, resp| {
                     if resp == gtk::ResponseType::Accept {
                     if let Some(file) = dlg.file() {
                         if let Some(path) = file.path() {
-                            let text = std::fs::read_to_string(&path).unwrap_or_default();
+                            let text = match read_limited_text(&path, MAX_BACKUP_BYTES) {
+                                Ok(text) => text,
+                                Err(err) => {
+                                    eprintln!("Failed to read backup: {}", err);
+                                    return;
+                                }
+                            };
                             #[derive(Deserialize, Default)]
                             struct BackupPayload {
                                 home_tags:   Option<Vec<String>>,
@@ -2075,7 +3658,16 @@ fn build_ui(app: &Application) {
                                 playlists:   Option<Vec<Station>>,
                                 custom_tags: Option<Vec<String>>,
                             }
-                            if let Ok(payload) = serde_json::from_str::<BackupPayload>(&text) {
+                            if let Ok(mut payload) = serde_json::from_str::<BackupPayload>(&text) {
+                                if let Some(ref mut stations) = payload.favourites {
+                                    stations.truncate(MAX_PLAYLIST_STATIONS);
+                                }
+                                if let Some(ref mut stations) = payload.playlists {
+                                    stations.truncate(MAX_PLAYLIST_STATIONS);
+                                }
+                                if let Some(ref mut tags) = payload.custom_tags {
+                                    tags.truncate(MAX_PLAYLIST_STATIONS);
+                                }
                                 let dialog_win = gtk::Window::builder()
                                     .title("Restore Application Data")
                                     .transient_for(&parent_rs)
@@ -2148,21 +3740,31 @@ fn build_ui(app: &Application) {
                                 let fv_data  = payload.favourites.clone();
                                 let pl_data  = payload.playlists.clone();
                                 let ct_data  = payload.custom_tags.clone();
+                                let tx_ap = tx_restore.clone();
+                                let custom_tags_restore_ap = custom_tags_restore.clone();
                                 apply_btn.connect_clicked(move |_| {
                                     let mut ui = ui_ap.lock().unwrap();
                                     if chk_ht.is_active() {
                                         if let Some(ref tags) = ht_data {
-                                            ui.cached_tags = Some(tags.iter().map(|name| BrowseItem { name: name.clone(), stationcount: 0 }).collect());
+                                            ui.cached_tags = Some(tags.iter().map(|name| BrowseItem { name: name.clone(), stationcount: 0, countrycode: String::new() }).collect());
                                         }
                                     }
                                     if chk_fv.is_active() {
                                         if let Some(ref favs) = fv_data {
-                                            ui.favorites = favs.clone();
+                                            ui.favorites = favs
+                                                .iter()
+                                                .filter(|station| is_allowed_stream_url(&station.url_resolved))
+                                                .cloned()
+                                                .collect();
                                         }
                                     }
                                     if chk_pl.is_active() {
                                         if let Some(ref pls) = pl_data {
-                                            ui.playlists = pls.clone();
+                                            ui.playlists = pls
+                                                .iter()
+                                                .filter(|station| is_allowed_stream_url(&station.url_resolved))
+                                                .cloned()
+                                                .collect();
                                         }
                                     }
                                     drop(ui);
@@ -2172,6 +3774,88 @@ fn build_ui(app: &Application) {
                                         }
                                     }
                                     save_ap.save_data();
+                                    while let Some(child) = custom_tags_restore_ap.first_child() {
+                                        custom_tags_restore_ap.remove(&child);
+                                    }
+                                    custom_tags_restore_ap.set_visible(false);
+                                    let current_view = ui_ap.lock().unwrap().current_view.clone();
+                                    match current_view {
+                                        ViewType::Tags => {
+                                            let items = ui_ap
+                                                .lock()
+                                                .unwrap()
+                                                .cached_tags
+                                                .clone()
+                                                .unwrap_or_default();
+                                            send_local_categories(&tx_ap, ViewType::Tags, items);
+                                        }
+                                        ViewType::Favorites => {
+                                            let mut ui = ui_ap.lock().unwrap();
+                                            let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                                                ui.favorites.clone()
+                                            } else {
+                                                let filtered = filter_stations_local(ui.favorites.clone(), ui.active_bitrate);
+                                                ui.stations = filtered.clone();
+                                                filtered
+                                            };
+                                            drop(ui);
+                                            send_local_stations(&tx_ap, ViewType::Favorites, stations, String::new());
+                                        }
+                                        ViewType::Recent => {
+                                            let mut ui = ui_ap.lock().unwrap();
+                                            let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                                                ui.recent_stations.clone()
+                                            } else {
+                                                let filtered = filter_stations_local(ui.recent_stations.clone(), ui.active_bitrate);
+                                                ui.stations = filtered.clone();
+                                                filtered
+                                            };
+                                            drop(ui);
+                                            send_local_stations(&tx_ap, ViewType::Recent, stations, String::new());
+                                        }
+                                        ViewType::Playlists => {
+                                            let mut ui = ui_ap.lock().unwrap();
+                                            let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                                                ui.playlists.clone()
+                                            } else {
+                                                let filtered = filter_stations_local(ui.playlists.clone(), ui.active_bitrate);
+                                                ui.stations = filtered.clone();
+                                                filtered
+                                            };
+                                            drop(ui);
+                                            send_local_stations(&tx_ap, ViewType::Playlists, stations, String::new());
+                                        }
+                                        view @ (ViewType::Stations | ViewType::CustomTag(_)) => {
+                                            let ui = ui_ap.lock().unwrap();
+                                            let stations = ui.stations.clone();
+                                            let limit = ui.station_limit;
+                                            let has_more_hint = ui.station_has_more_hint;
+                                            drop(ui);
+                                            send_local_stations_with_limit_hint(
+                                                &tx_ap,
+                                                view,
+                                                stations,
+                                                String::new(),
+                                                limit,
+                                                has_more_hint,
+                                            );
+                                        }
+                                        view @ (ViewType::Languages | ViewType::Countries) => {
+                                            let (view, url) = match view {
+                                                ViewType::Languages => (
+                                                    ViewType::Languages,
+                                                    "https://de1.api.radio-browser.info/json/languages?order=stationcount&reverse=true".to_string(),
+                                                ),
+                                                ViewType::Countries => (
+                                                    ViewType::Countries,
+                                                    "https://de1.api.radio-browser.info/json/countries?order=stationcount&reverse=true".to_string(),
+                                                ),
+                                                _ => unreachable!(),
+                                            };
+                                            ui_ap.lock().unwrap().last_fetched_url = url.clone();
+                                            fetch_data_async(url, false, view, prefs_ap.clone(), tx_ap.clone(), false);
+                                        }
+                                    }
                                     dw_apply.close();
                                 });
 
@@ -2193,13 +3877,13 @@ fn build_ui(app: &Application) {
 
         page.add(&about_group);
         prefs_window.add(&page);
-        
+
         let prefs_close_save = app_state_prefs_close_ref.clone();
         prefs_window.connect_close_request(move |_| {
             prefs_close_save.save_data();
             adw::glib::signal::Propagation::Proceed
         });
-        
+
         prefs_window.present();
     });
 
@@ -2211,12 +3895,12 @@ fn build_ui(app: &Application) {
     let list_box_tags = list_box.clone();
     let browsing_tags = now_browsing_label.clone();
     // Pre-clone for the four bitrate handlers that come after this closure
-    let br_btn_for_any  = bitrate_menu_btn.clone();
-    let br_btn_for_low  = bitrate_menu_btn.clone();
+    let br_btn_for_any = bitrate_menu_btn.clone();
+    let br_btn_for_low = bitrate_menu_btn.clone();
     let br_btn_for_high = bitrate_menu_btn.clone();
     let br_btn_for_flac = bitrate_menu_btn.clone();
-    let save_mgr_br_any  = app_state_manager.clone();
-    let save_mgr_br_low  = app_state_manager.clone();
+    let save_mgr_br_any = app_state_manager.clone();
+    let save_mgr_br_low = app_state_manager.clone();
     let save_mgr_br_high = app_state_manager.clone();
     let save_mgr_br_flac = app_state_manager.clone();
     let import_btn_tags = import_btn_clone.clone();
@@ -2243,17 +3927,27 @@ fn build_ui(app: &Application) {
                 .spacing(0)
                 .hexpand(true)
                 .build();
-            let hbox = Box::builder().orientation(Orientation::Horizontal).spacing(6).margin_start(20).halign(gtk::Align::Start).build();
+            let hbox = Box::builder()
+                .orientation(Orientation::Horizontal)
+                .spacing(6)
+                .margin_start(20)
+                .halign(gtk::Align::Start)
+                .build();
             let icon_img = gtk::Image::from_icon_name(tag_to_icon(&tag));
             icon_img.set_icon_size(gtk::IconSize::Normal);
-            let lbl = Label::builder().label(&tag).css_classes(vec!["caption".to_string()]).build();
-            hbox.append(&icon_img); hbox.append(&lbl);
+            let lbl = Label::builder()
+                .label(&tag)
+                .css_classes(vec!["caption".to_string()])
+                .build();
+            hbox.append(&icon_img);
+            hbox.append(&lbl);
             let btn = Button::builder()
                 .child(&hbox)
                 .css_classes(vec!["flat".to_string()])
                 .hexpand(true)
                 .tooltip_text(&tag)
-                .margin_top(1).margin_bottom(1)
+                .margin_top(1)
+                .margin_bottom(1)
                 .build();
             let tag_click = tag.clone();
             let tx_c = tx_custom_tags_toggle.clone();
@@ -2275,11 +3969,16 @@ fn build_ui(app: &Application) {
                 for i in 0..n {
                     if let Some(child) = btns_container.observe_children().item(i) {
                         if let Ok(row) = child.downcast::<Box>() {
-                            if let Some(cb) = row.first_child().and_then(|c| c.downcast::<Button>().ok()) {
+                            if let Some(cb) =
+                                row.first_child().and_then(|c| c.downcast::<Button>().ok())
+                            {
                                 let tag_name = cb.tooltip_text().unwrap_or_default();
                                 if let Some(box_child) = cb.child() {
                                     if let Some(hb) = box_child.downcast_ref::<Box>() {
-                                        if let Some(img) = hb.first_child().and_then(|i| i.downcast::<gtk::Image>().ok()) {
+                                        if let Some(img) = hb
+                                            .first_child()
+                                            .and_then(|i| i.downcast::<gtk::Image>().ok())
+                                        {
                                             img.set_icon_name(Some(tag_to_icon(&tag_name)));
                                         }
                                     }
@@ -2308,7 +4007,7 @@ fn build_ui(app: &Application) {
                 // Sync bitrate label
                 br_btn_c.set_label(match ui.active_bitrate {
                     BitrateFilterSetting::None => "⊟ Bitrate",
-                    BitrateFilterSetting::Low  => "⊟ Low ≤160",
+                    BitrateFilterSetting::Low => "⊟ Low ≤160",
                     BitrateFilterSetting::High => "⊟ High ≥192",
                     BitrateFilterSetting::Flac => "⊟ FLAC",
                 });
@@ -2317,12 +4016,20 @@ fn build_ui(app: &Application) {
                     list_box_tag_btn.remove(&child);
                 }
                 browsing_tag_btn.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::CustomTag(tag_click.clone()), prefs_c.clone(), tx_c.clone(), false);
+                fetch_data_async(
+                    url,
+                    true,
+                    ViewType::CustomTag(tag_click.clone()),
+                    prefs_c.clone(),
+                    tx_c.clone(),
+                    false,
+                );
             });
             let rm_btn = Button::builder()
                 .icon_name("window-close-symbolic")
                 .css_classes(vec!["flat".to_string()])
-                .margin_top(1).margin_bottom(1)
+                .margin_top(1)
+                .margin_bottom(1)
                 .tooltip_text("Remove tag")
                 .build();
             let tag_rm = tag.clone();
@@ -2331,7 +4038,11 @@ fn build_ui(app: &Application) {
             let container_rm = custom_tag_btns_toggle.clone();
             let save_mgr_toggle_rm = state_toggle_save.clone();
             rm_btn.connect_clicked(move |_| {
-                prefs_rm_toggle.lock().unwrap().custom_tags.retain(|t| t != &tag_rm);
+                prefs_rm_toggle
+                    .lock()
+                    .unwrap()
+                    .custom_tags
+                    .retain(|t| t != &tag_rm);
                 save_mgr_toggle_rm.save_data();
                 container_rm.remove(&row_box_rm);
             });
@@ -2342,14 +4053,16 @@ fn build_ui(app: &Application) {
         custom_tag_btns_toggle.set_visible(true);
     });
 
-    let tx_tag = tx.clone(); let prefs_tag = app_prefs.clone(); let ui_tag = ui_state.clone();
+    let tx_tag = tx.clone();
+    let prefs_tag = app_prefs.clone();
+    let ui_tag = ui_state.clone();
     tag_btn.connect_clicked(move |_| {
         let mut ui = ui_tag.lock().unwrap();
         if let Some(cached) = ui.cached_tags.clone() {
             ui.last_fetched_url = "https://de1.api.radio-browser.info/json/tags?order=stationcount&reverse=true&hidebroken=true".to_string();
             ui.active_category = CategoryFilter::None;
             drop(ui);
-            let _ = tx_tag.send_blocking(IncomingData::Categories(ViewType::Tags, cached));
+            send_local_categories(&tx_tag, ViewType::Tags, cached);
             return;
         }
         let target_url = "https://de1.api.radio-browser.info/json/tags?order=stationcount&reverse=true&hidebroken=true".to_string();
@@ -2371,6 +4084,7 @@ fn build_ui(app: &Application) {
             match prev {
                 ViewType::Tags | ViewType::Languages | ViewType::Countries => {
                     ui.current_view = prev.clone();
+                    ui.active_category = CategoryFilter::None;
                     ui.last_fetched_url = url.clone();
                     let cached = match &prev {
                         ViewType::Tags => ui.cached_tags.clone(),
@@ -2380,10 +4094,17 @@ fn build_ui(app: &Application) {
                     };
                     if let Some(items) = cached {
                         drop(ui);
-                        let _ = back_tx.send_blocking(IncomingData::Categories(prev, items));
+                        send_local_categories(&back_tx, prev, items);
                     } else {
                         drop(ui);
-                        fetch_data_async(url, false, prev, back_prefs.clone(), back_tx.clone(), false);
+                        fetch_data_async(
+                            url,
+                            false,
+                            prev,
+                            back_prefs.clone(),
+                            back_tx.clone(),
+                            false,
+                        );
                     }
                 }
                 ViewType::CustomTag(ref tag) => {
@@ -2398,87 +4119,160 @@ fn build_ui(app: &Application) {
                         back_list.remove(&child);
                     }
                     back_browsing.set_text("Loading stations...");
-                    fetch_data_async(cat_url, true, ViewType::CustomTag(tag), back_prefs.clone(), back_tx.clone(), false);
+                    fetch_data_async(
+                        cat_url,
+                        true,
+                        ViewType::CustomTag(tag),
+                        back_prefs.clone(),
+                        back_tx.clone(),
+                        false,
+                    );
                 }
                 ViewType::Stations => {
-                    let cat_url = build_filtered_url(&ui.active_category, ui.active_bitrate);
+                    let cat_url = if url.contains("/json/stations/") {
+                        url.clone()
+                    } else {
+                        build_filtered_url(&ui.active_category, ui.active_bitrate)
+                    };
                     ui.current_view = ViewType::Stations;
                     ui.last_fetched_url = cat_url.clone();
                     drop(ui);
-                    fetch_data_async(cat_url, true, ViewType::Stations, back_prefs.clone(), back_tx.clone(), false);
+                    fetch_data_async(
+                        cat_url,
+                        true,
+                        ViewType::Stations,
+                        back_prefs.clone(),
+                        back_tx.clone(),
+                        false,
+                    );
                 }
                 ViewType::Favorites => {
-                    let stations = ui.favorites.clone();
+                    let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                        ui.favorites.clone()
+                    } else {
+                        let filtered =
+                            filter_stations_local(ui.favorites.clone(), ui.active_bitrate);
+                        ui.stations = filtered.clone();
+                        filtered
+                    };
                     ui.current_view = ViewType::Favorites;
+                    ui.current_index = None;
                     ui.active_category = CategoryFilter::None;
                     ui.last_fetched_url = url.clone();
                     drop(ui);
                     back_browsing.set_text("Favorite Stations");
-                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new(), false));
+                    send_local_stations(&back_tx, ViewType::Favorites, stations, String::new());
                 }
                 ViewType::Recent => {
-                    let stations = ui.recent_stations.clone();
+                    let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                        ui.recent_stations.clone()
+                    } else {
+                        let filtered =
+                            filter_stations_local(ui.recent_stations.clone(), ui.active_bitrate);
+                        ui.stations = filtered.clone();
+                        filtered
+                    };
                     ui.current_view = ViewType::Recent;
+                    ui.current_index = None;
                     ui.active_category = CategoryFilter::None;
                     ui.last_fetched_url = url.clone();
                     drop(ui);
                     back_browsing.set_text("Recently Played");
-                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new(), false));
+                    send_local_stations(&back_tx, ViewType::Recent, stations, String::new());
                 }
                 ViewType::Playlists => {
-                    let stations = ui.playlists.clone();
+                    let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                        ui.playlists.clone()
+                    } else {
+                        let filtered =
+                            filter_stations_local(ui.playlists.clone(), ui.active_bitrate);
+                        ui.stations = filtered.clone();
+                        filtered
+                    };
                     ui.current_view = ViewType::Playlists;
+                    ui.current_index = None;
                     ui.active_category = CategoryFilter::None;
                     ui.last_fetched_url = url.clone();
                     drop(ui);
                     back_browsing.set_text("Imported Playlist");
-                    let _ = back_tx.send_blocking(IncomingData::Stations(stations, String::new(), false));
+                    send_local_stations(&back_tx, ViewType::Playlists, stations, String::new());
                 }
             }
         }
     });
 
-    let tx_lang = tx.clone(); let prefs_lang = app_prefs.clone(); let ui_lang = ui_state.clone();
+    let tx_lang = tx.clone();
+    let prefs_lang = app_prefs.clone();
+    let ui_lang = ui_state.clone();
     lang_btn.connect_clicked(move |_| {
         let mut ui = ui_lang.lock().unwrap();
         if let Some(cached) = ui.cached_languages.clone() {
-            ui.last_fetched_url = "https://de1.api.radio-browser.info/json/languages?order=stationcount&reverse=true".to_string();
+            ui.last_fetched_url =
+                "https://de1.api.radio-browser.info/json/languages?order=stationcount&reverse=true"
+                    .to_string();
             ui.active_category = CategoryFilter::None;
             drop(ui);
-            let _ = tx_lang.send_blocking(IncomingData::Categories(ViewType::Languages, cached));
+            send_local_categories(&tx_lang, ViewType::Languages, cached);
             return;
         }
-        let target_url = "https://de1.api.radio-browser.info/json/languages?order=stationcount&reverse=true".to_string();
+        let target_url =
+            "https://de1.api.radio-browser.info/json/languages?order=stationcount&reverse=true"
+                .to_string();
         ui.last_fetched_url = target_url.clone();
         ui.active_category = CategoryFilter::None;
         drop(ui);
-        fetch_data_async(target_url, false, ViewType::Languages, prefs_lang.clone(), tx_lang.clone(), false);
+        fetch_data_async(
+            target_url,
+            false,
+            ViewType::Languages,
+            prefs_lang.clone(),
+            tx_lang.clone(),
+            false,
+        );
     });
 
-    let tx_country = tx.clone(); let prefs_country = app_prefs.clone(); let ui_country = ui_state.clone();
+    let tx_country = tx.clone();
+    let prefs_country = app_prefs.clone();
+    let ui_country = ui_state.clone();
     country_btn.connect_clicked(move |_| {
         let mut ui = ui_country.lock().unwrap();
         if let Some(cached) = ui.cached_countries.clone() {
-            ui.last_fetched_url = "https://de1.api.radio-browser.info/json/countries?order=stationcount&reverse=true".to_string();
+            ui.last_fetched_url =
+                "https://de1.api.radio-browser.info/json/countries?order=stationcount&reverse=true"
+                    .to_string();
             ui.active_category = CategoryFilter::None;
             drop(ui);
-            let _ = tx_country.send_blocking(IncomingData::Categories(ViewType::Countries, cached));
+            send_local_categories(&tx_country, ViewType::Countries, cached);
             return;
         }
-        let target_url = "https://de1.api.radio-browser.info/json/countries?order=stationcount&reverse=true".to_string();
+        let target_url =
+            "https://de1.api.radio-browser.info/json/countries?order=stationcount&reverse=true"
+                .to_string();
         ui.last_fetched_url = target_url.clone();
         ui.active_category = CategoryFilter::None;
         drop(ui);
-        fetch_data_async(target_url, false, ViewType::Countries, prefs_country.clone(), tx_country.clone(), false);
+        fetch_data_async(
+            target_url,
+            false,
+            ViewType::Countries,
+            prefs_country.clone(),
+            tx_country.clone(),
+            false,
+        );
     });
 
     let list_box_search = list_box.clone();
     let browsing_search = now_browsing_label.clone();
-    let tx_search = tx.clone(); let prefs_search = app_prefs.clone(); let ui_search = ui_state.clone();
+    let tx_search = tx.clone();
+    let prefs_search = app_prefs.clone();
+    let ui_search = ui_state.clone();
     search_entry.connect_activate(move |entry| {
         let query = entry.text().to_string();
         if !query.is_empty() {
-            let target_url = format!("https://de1.api.radio-browser.info/json/stations/byname/{}", urlencoding::encode(&query));
+            let target_url = format!(
+                "https://de1.api.radio-browser.info/json/stations/byname/{}",
+                urlencoding::encode(&query)
+            );
             let mut ui = ui_search.lock().unwrap();
             ui.previous_view = Some(ui.current_view.clone());
             ui.previous_url = ui.last_fetched_url.clone();
@@ -2490,7 +4284,14 @@ fn build_ui(app: &Application) {
                 list_box_search.remove(&child);
             }
             browsing_search.set_text("Loading stations...");
-            fetch_data_async(target_url, true, ViewType::Stations, prefs_search.clone(), tx_search.clone(), false);
+            fetch_data_async(
+                target_url,
+                true,
+                ViewType::Stations,
+                prefs_search.clone(),
+                tx_search.clone(),
+                false,
+            );
         }
     });
 
@@ -2505,51 +4306,106 @@ fn build_ui(app: &Application) {
                 if asc {
                     ui.categories.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.categories.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
+                    ui.categories
+                        .sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Categories(ui.current_view.clone(), ui.categories.clone()));
+                send_local_categories(&tx_abc_sort, ui.current_view.clone(), ui.categories.clone());
             }
             ViewType::Stations | ViewType::CustomTag(_) => {
                 if asc {
                     ui.stations.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.stations.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
+                    ui.stations
+                        .sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.stations.clone(), ui.last_update_timestamp.clone(), false));
+                send_local_stations_with_limit_hint(
+                    &tx_abc_sort,
+                    ui.current_view.clone(),
+                    ui.stations.clone(),
+                    ui.last_update_timestamp.clone(),
+                    ui.station_limit,
+                    ui.station_has_more_hint,
+                );
             }
             ViewType::Playlists => {
                 if asc {
                     ui.playlists.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.playlists.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
+                    ui.playlists
+                        .sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.playlists.clone(), ui.last_update_timestamp.clone(), false));
+                let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                    ui.playlists.clone()
+                } else {
+                    let filtered = filter_stations_local(ui.playlists.clone(), ui.active_bitrate);
+                    ui.stations = filtered.clone();
+                    filtered
+                };
+                send_local_stations(
+                    &tx_abc_sort,
+                    ViewType::Playlists,
+                    stations,
+                    ui.last_update_timestamp.clone(),
+                );
             }
             ViewType::Favorites => {
                 if asc {
                     ui.favorites.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.favorites.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
+                    ui.favorites
+                        .sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.favorites.clone(), ui.last_update_timestamp.clone(), false));
+                let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                    ui.favorites.clone()
+                } else {
+                    let filtered = filter_stations_local(ui.favorites.clone(), ui.active_bitrate);
+                    ui.stations = filtered.clone();
+                    filtered
+                };
+                send_local_stations(
+                    &tx_abc_sort,
+                    ViewType::Favorites,
+                    stations,
+                    ui.last_update_timestamp.clone(),
+                );
             }
             ViewType::Recent => {
                 if asc {
                     ui.recent_stations.sort_by_key(|a| a.name.to_lowercase());
                 } else {
-                    ui.recent_stations.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
+                    ui.recent_stations
+                        .sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
                 }
-                let _ = tx_abc_sort.send_blocking(IncomingData::Stations(ui.recent_stations.clone(), ui.last_update_timestamp.clone(), false));
+                let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                    ui.recent_stations.clone()
+                } else {
+                    let filtered =
+                        filter_stations_local(ui.recent_stations.clone(), ui.active_bitrate);
+                    ui.stations = filtered.clone();
+                    filtered
+                };
+                send_local_stations(
+                    &tx_abc_sort,
+                    ViewType::Recent,
+                    stations,
+                    ui.last_update_timestamp.clone(),
+                );
             }
         }
         sort_ascending.set(!asc);
     });
 
     let list_box_votes = list_box.clone();
-    let tx_votes = tx.clone(); let prefs_votes = app_prefs.clone(); let ui_votes = ui_state.clone(); let browsing_votes = now_browsing_label.clone();
+    let tx_votes = tx.clone();
+    let prefs_votes = app_prefs.clone();
+    let ui_votes = ui_state.clone();
+    let browsing_votes = now_browsing_label.clone();
     votes_sidebar_btn.connect_clicked(move |_| {
         let target_url = "https://de1.api.radio-browser.info/json/stations/topvote/150".to_string();
         let mut ui = ui_votes.lock().unwrap();
+        ui.previous_view = Some(ui.current_view.clone());
+        ui.previous_url = ui.last_fetched_url.clone();
+        ui.current_view = ViewType::Stations;
         ui.last_fetched_url = target_url.clone();
         ui.active_category = CategoryFilter::None;
         drop(ui);
@@ -2557,8 +4413,14 @@ fn build_ui(app: &Application) {
         while let Some(child) = list_box_votes.first_child() {
             list_box_votes.remove(&child);
         }
-        browsing_votes.set_text("Loading stations...");
-        fetch_data_async(target_url, true, ViewType::Stations, prefs_votes.clone(), tx_votes.clone(), false);
+        fetch_data_async(
+            target_url,
+            true,
+            ViewType::Stations,
+            prefs_votes.clone(),
+            tx_votes.clone(),
+            false,
+        );
     });
 
     let ui_fav_menu = ui_state.clone();
@@ -2570,6 +4432,7 @@ fn build_ui(app: &Application) {
     let clear_recents_fav = clear_recents_btn.clone();
     let br_area_fav = br_area.clone();
     fav_menu_btn.connect_clicked(move |_| {
+        begin_request();
         br_area_fav.set_visible(true);
         import_btn_fav.set_visible(false);
         clear_recents_fav.set_visible(false);
@@ -2580,6 +4443,7 @@ fn build_ui(app: &Application) {
         ui.previous_view = Some(ui.current_view.clone());
         ui.previous_url = ui.last_fetched_url.clone();
         ui.current_view = ViewType::Favorites;
+        ui.current_index = None;
         browsing_fav.set_text("Favorite Stations");
         let display_list: Vec<Station> = if ui.active_bitrate != BitrateFilterSetting::None {
             let filtered = filter_stations_local(ui.favorites.clone(), ui.active_bitrate);
@@ -2593,12 +4457,17 @@ fn build_ui(app: &Application) {
             ui.favorites.clone()
         };
         drop(ui);
-        
+
         for station in &display_list {
-            let br_badge = station.bitrate.map_or(String::new(), |b| format!(" [{} kbps]", b));
+            let br_badge = station
+                .bitrate
+                .map_or(String::new(), |b| format!(" [{} kbps]", b));
             let row = ActionRow::builder()
-                .title(glib::markup_escape_text(station.name.trim()).to_string())
-                .subtitle(format!("{} | {}{}", glib::markup_escape_text(&station.country), glib::markup_escape_text(&station.tags), br_badge))
+                .title(station.name.trim())
+                .subtitle(format!(
+                    "{} | {}{}",
+                    station.country, station.tags, br_badge
+                ))
                 .activatable(true)
                 .build();
             let remove_fav_btn = Button::builder()
@@ -2614,11 +4483,20 @@ fn build_ui(app: &Application) {
             let row_clone = row.clone();
             let save_mgr_fav_rm = state_fav_rm_save.clone();
             remove_fav_btn.connect_clicked(move |_| {
-                ui_rm_fav.lock().unwrap().favorites.retain(|f| !station_eq(f, &station_to_remove));
+                begin_request();
+                let mut ui = ui_rm_fav.lock().unwrap();
+                ui.favorites.retain(|f| !station_eq(f, &station_to_remove));
+                ui.current_index = None;
+                let display_count = if ui.active_bitrate == BitrateFilterSetting::None {
+                    ui.favorites.len()
+                } else {
+                    ui.stations = filter_stations_local(ui.favorites.clone(), ui.active_bitrate);
+                    ui.stations.len()
+                };
+                drop(ui);
                 save_mgr_fav_rm.save_data();
                 list_rm_fav.remove(&row_clone);
-                let remaining = ui_rm_fav.lock().unwrap().favorites.len();
-                count_rm_fav.set_text(&format!("{} favorite stations displayed", remaining));
+                count_rm_fav.set_text(&format!("{} favorite stations displayed", display_count));
             });
             row.add_suffix(&remove_fav_btn);
             list_box_fav.append(&row);
@@ -2633,6 +4511,7 @@ fn build_ui(app: &Application) {
     let clear_recents_rec = clear_recents_btn.clone();
     let br_area_rec = br_area.clone();
     recent_nav_btn.connect_clicked(move |_| {
+        begin_request();
         br_area_rec.set_visible(true);
         import_btn_rec.set_visible(false);
         clear_recents_rec.set_visible(true);
@@ -2643,6 +4522,7 @@ fn build_ui(app: &Application) {
         ui.previous_view = Some(ui.current_view.clone());
         ui.previous_url = ui.last_fetched_url.clone();
         ui.current_view = ViewType::Recent;
+        ui.current_index = None;
         browsing_recent.set_text("Recently Played");
         let display_list: Vec<Station> = if ui.active_bitrate != BitrateFilterSetting::None {
             let filtered = filter_stations_local(ui.recent_stations.clone(), ui.active_bitrate);
@@ -2657,10 +4537,15 @@ fn build_ui(app: &Application) {
         };
         drop(ui);
         for station in &display_list {
-            let br_badge = station.bitrate.map_or(String::new(), |b| format!(" [{} kbps]", b));
+            let br_badge = station
+                .bitrate
+                .map_or(String::new(), |b| format!(" [{} kbps]", b));
             let row = ActionRow::builder()
-                .title(glib::markup_escape_text(station.name.trim()).to_string())
-                .subtitle(format!("{} | {}{}", glib::markup_escape_text(&station.country), glib::markup_escape_text(&station.tags), br_badge))
+                .title(station.name.trim())
+                .subtitle(format!(
+                    "{} | {}{}",
+                    station.country, station.tags, br_badge
+                ))
                 .activatable(true)
                 .build();
             list_box_recent.append(&row);
@@ -2687,6 +4572,7 @@ fn build_ui(app: &Application) {
         view.previous_view = Some(view.current_view.clone());
         view.previous_url = view.last_fetched_url.clone();
         view.current_view = ViewType::Playlists;
+        view.current_index = None;
         view.active_category = CategoryFilter::None;
         let stations = if view.playlists.is_empty() {
             count_lbl_playlists.set_text("No playlist imported");
@@ -2702,7 +4588,7 @@ fn build_ui(app: &Application) {
             view.playlists.clone()
         };
         drop(view);
-        let _ = tx_pl.send_blocking(IncomingData::Stations(stations, String::new(), false));
+        send_local_stations(&tx_pl, ViewType::Playlists, stations, String::new());
     });
 
     let ui_imp = ui_state.clone();
@@ -2735,29 +4621,48 @@ fn build_ui(app: &Application) {
             if response == gtk::ResponseType::Accept {
                 if let Some(file) = dialog.file() {
                     if let Some(path) = file.path() {
-                        let content = std::fs::read_to_string(&path).unwrap_or_default();
-                        let parsed = if path.extension().map(|e| e == "m3u" || e == "M3U").unwrap_or(false) {
+                        begin_request();
+                        let content = match read_limited_text(&path, MAX_PLAYLIST_BYTES) {
+                            Ok(content) => content,
+                            Err(err) => {
+                                eprintln!("Failed to read playlist: {}", err);
+                                return;
+                            }
+                        };
+                        let parsed = if path
+                            .extension()
+                            .map(|e| e == "m3u" || e == "M3U")
+                            .unwrap_or(false)
+                        {
                             parse_m3u(&content)
                         } else {
                             parse_pls(&content)
                         };
                         if !parsed.is_empty() {
                             let mut v = vf.lock().unwrap();
-                            v.playlists.extend(parsed);
+                            let remaining = MAX_PLAYLIST_STATIONS.saturating_sub(v.playlists.len());
+                            v.playlists.extend(parsed.into_iter().take(remaining));
                             v.current_view = ViewType::Playlists;
+                            v.current_index = None;
+                            v.active_category = CategoryFilter::None;
+                            let stations = if v.active_bitrate == BitrateFilterSetting::None {
+                                v.playlists.clone()
+                            } else {
+                                filter_stations_local(v.playlists.clone(), v.active_bitrate)
+                            };
+                            v.stations = stations.clone();
                             drop(v);
                             sm.save_data();
                             while let Some(child) = lf.first_child() {
                                 lf.remove(&child);
                             }
                             let vv = vf.lock().unwrap();
-                            cf.set_text(&format!("{} stations in playlist", vv.playlists.len()));
-                            let stations = vv.playlists.clone();
+                            cf.set_text(&format!("{} stations in playlist", stations.len()));
                             drop(vv);
                             for s in stations.iter() {
                                 let row = ActionRow::builder()
-                                    .title(glib::markup_escape_text(s.name.trim()).to_string())
-                                    .subtitle(glib::markup_escape_text(&s.url_resolved).to_string())
+                                    .title(s.name.trim())
+                                    .subtitle(&s.url_resolved)
                                     .activatable(true)
                                     .build();
                                 let rm_btn = Button::builder()
@@ -2771,17 +4676,38 @@ fn build_ui(app: &Application) {
                                 let count_rm = cf.clone();
                                 let row_clone = row.clone();
                                 let save_rm = sm.clone();
+                                let station_to_remove = s.clone();
                                 rm_btn.connect_clicked(move |_| {
-                                    let idx = row_clone.index() as usize;
+                                    begin_request();
                                     let mut v = view_rm.lock().unwrap();
-                                    if idx < v.playlists.len() {
-                                        v.playlists.remove(idx);
+                                    let pos = if station_to_remove.stationuuid.is_empty() {
+                                        v.playlists.iter().position(|p| {
+                                            p.url_resolved == station_to_remove.url_resolved
+                                                && p.name == station_to_remove.name
+                                        })
+                                    } else {
+                                        v.playlists.iter().position(|p| {
+                                            p.stationuuid == station_to_remove.stationuuid
+                                        })
+                                    };
+                                    if let Some(pos) = pos {
+                                        v.playlists.remove(pos);
                                         v.current_view = ViewType::Playlists;
+                                        v.current_index = None;
+                                        if v.active_bitrate != BitrateFilterSetting::None {
+                                            v.stations = filter_stations_local(
+                                                v.playlists.clone(),
+                                                v.active_bitrate,
+                                            );
+                                        }
                                         drop(v);
                                         save_rm.save_data();
                                         list_rm.remove(&row_clone);
                                         let remaining = view_rm.lock().unwrap().playlists.len();
-                                        count_rm.set_text(&format!("{} stations in playlist", remaining));
+                                        count_rm.set_text(&format!(
+                                            "{} stations in playlist",
+                                            remaining
+                                        ));
                                     }
                                 });
                                 row.add_suffix(&rm_btn);
@@ -2800,7 +4726,12 @@ fn build_ui(app: &Application) {
     let clear_recents_count = stations_count_label.clone();
     let clear_recents_save = app_state_manager.clone();
     clear_recents_btn.connect_clicked(move |_| {
-        clear_recents_ui.lock().unwrap().recent_stations.clear();
+        begin_request();
+        let mut ui = clear_recents_ui.lock().unwrap();
+        ui.recent_stations.clear();
+        ui.stations.clear();
+        ui.current_index = None;
+        drop(ui);
         clear_recents_save.save_data();
         while let Some(child) = clear_recents_list.first_child() {
             clear_recents_list.remove(&child);
@@ -2810,13 +4741,19 @@ fn build_ui(app: &Application) {
 
     let list_box_br = list_box.clone();
     let browsing_br = now_browsing_label.clone();
-    let tx_any = tx.clone(); let prefs_any = app_prefs.clone(); let pop_any = bitrate_popover.clone(); let ui_any = ui_state.clone();
+    let tx_any = tx.clone();
+    let prefs_any = app_prefs.clone();
+    let pop_any = bitrate_popover.clone();
+    let ui_any = ui_state.clone();
     any_br_btn.connect_clicked(move |_| {
         pop_any.popdown();
         let mut ui = ui_any.lock().unwrap();
         ui.active_bitrate = BitrateFilterSetting::None;
         let view = ui.current_view.clone();
-        if matches!(view, ViewType::Favorites | ViewType::Recent | ViewType::Playlists) {
+        if matches!(
+            view,
+            ViewType::Favorites | ViewType::Recent | ViewType::Playlists
+        ) {
             let stations = match view {
                 ViewType::Favorites => ui.favorites.clone(),
                 ViewType::Recent => ui.recent_stations.clone(),
@@ -2826,7 +4763,8 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::None);
             drop(ui);
             br_btn_for_any.set_label("⊟ Bitrate");
-            let _ = tx_any.send_blocking(IncomingData::Stations(filtered, String::new(), false));
+            send_local_stations(&tx_any, view.clone(), filtered, String::new());
+            save_mgr_br_any.save_data();
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2838,18 +4776,31 @@ fn build_ui(app: &Application) {
             list_box_br.remove(&child);
         }
         browsing_br.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_any.clone(), tx_any.clone(), false);
+        fetch_data_async(
+            url,
+            true,
+            station_response_view(&view),
+            prefs_any.clone(),
+            tx_any.clone(),
+            false,
+        );
     });
 
     let list_box_low = list_box.clone();
     let browsing_low = now_browsing_label.clone();
-    let tx_low = tx.clone(); let prefs_low = app_prefs.clone(); let pop_low = bitrate_popover.clone(); let ui_low = ui_state.clone();
+    let tx_low = tx.clone();
+    let prefs_low = app_prefs.clone();
+    let pop_low = bitrate_popover.clone();
+    let ui_low = ui_state.clone();
     low_br_btn.connect_clicked(move |_| {
         pop_low.popdown();
         let mut ui = ui_low.lock().unwrap();
         ui.active_bitrate = BitrateFilterSetting::Low;
         let view = ui.current_view.clone();
-        if matches!(view, ViewType::Favorites | ViewType::Recent | ViewType::Playlists) {
+        if matches!(
+            view,
+            ViewType::Favorites | ViewType::Recent | ViewType::Playlists
+        ) {
             let stations = match view {
                 ViewType::Favorites => ui.favorites.clone(),
                 ViewType::Recent => ui.recent_stations.clone(),
@@ -2859,7 +4810,8 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::Low);
             drop(ui);
             br_btn_for_low.set_label("⊟ Low ≤160");
-            let _ = tx_low.send_blocking(IncomingData::Stations(filtered, String::new(), false));
+            send_local_stations(&tx_low, view.clone(), filtered, String::new());
+            save_mgr_br_low.save_data();
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2871,18 +4823,31 @@ fn build_ui(app: &Application) {
             list_box_low.remove(&child);
         }
         browsing_low.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_low.clone(), tx_low.clone(), false);
+        fetch_data_async(
+            url,
+            true,
+            station_response_view(&view),
+            prefs_low.clone(),
+            tx_low.clone(),
+            false,
+        );
     });
 
     let list_box_high = list_box.clone();
     let browsing_high = now_browsing_label.clone();
-    let tx_high = tx.clone(); let prefs_high = app_prefs.clone(); let pop_high = bitrate_popover.clone(); let ui_high = ui_state.clone();
+    let tx_high = tx.clone();
+    let prefs_high = app_prefs.clone();
+    let pop_high = bitrate_popover.clone();
+    let ui_high = ui_state.clone();
     high_br_btn.connect_clicked(move |_| {
         pop_high.popdown();
         let mut ui = ui_high.lock().unwrap();
         ui.active_bitrate = BitrateFilterSetting::High;
         let view = ui.current_view.clone();
-        if matches!(view, ViewType::Favorites | ViewType::Recent | ViewType::Playlists) {
+        if matches!(
+            view,
+            ViewType::Favorites | ViewType::Recent | ViewType::Playlists
+        ) {
             let stations = match view {
                 ViewType::Favorites => ui.favorites.clone(),
                 ViewType::Recent => ui.recent_stations.clone(),
@@ -2892,7 +4857,8 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::High);
             drop(ui);
             br_btn_for_high.set_label("⊟ High ≥192");
-            let _ = tx_high.send_blocking(IncomingData::Stations(filtered, String::new(), false));
+            send_local_stations(&tx_high, view.clone(), filtered, String::new());
+            save_mgr_br_high.save_data();
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2904,18 +4870,31 @@ fn build_ui(app: &Application) {
             list_box_high.remove(&child);
         }
         browsing_high.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_high.clone(), tx_high.clone(), false);
+        fetch_data_async(
+            url,
+            true,
+            station_response_view(&view),
+            prefs_high.clone(),
+            tx_high.clone(),
+            false,
+        );
     });
 
     let list_box_flac = list_box.clone();
     let browsing_flac = now_browsing_label.clone();
-    let tx_flac = tx.clone(); let prefs_flac = app_prefs.clone(); let pop_flac = bitrate_popover.clone(); let ui_flac = ui_state.clone();
+    let tx_flac = tx.clone();
+    let prefs_flac = app_prefs.clone();
+    let pop_flac = bitrate_popover.clone();
+    let ui_flac = ui_state.clone();
     flac_br_btn.connect_clicked(move |_| {
         pop_flac.popdown();
         let mut ui = ui_flac.lock().unwrap();
         ui.active_bitrate = BitrateFilterSetting::Flac;
         let view = ui.current_view.clone();
-        if matches!(view, ViewType::Favorites | ViewType::Recent | ViewType::Playlists) {
+        if matches!(
+            view,
+            ViewType::Favorites | ViewType::Recent | ViewType::Playlists
+        ) {
             let stations = match view {
                 ViewType::Favorites => ui.favorites.clone(),
                 ViewType::Recent => ui.recent_stations.clone(),
@@ -2925,7 +4904,8 @@ fn build_ui(app: &Application) {
             let filtered = filter_stations_local(stations, BitrateFilterSetting::Flac);
             drop(ui);
             br_btn_for_flac.set_label("⊟ FLAC");
-            let _ = tx_flac.send_blocking(IncomingData::Stations(filtered, String::new(), false));
+            send_local_stations(&tx_flac, view.clone(), filtered, String::new());
+            save_mgr_br_flac.save_data();
             return;
         }
         let url = build_filtered_url(&ui.active_category, ui.active_bitrate);
@@ -2937,7 +4917,14 @@ fn build_ui(app: &Application) {
             list_box_flac.remove(&child);
         }
         browsing_flac.set_text("Loading stations...");
-        fetch_data_async(url, true, ViewType::Stations, prefs_flac.clone(), tx_flac.clone(), false);
+        fetch_data_async(
+            url,
+            true,
+            station_response_view(&view),
+            prefs_flac.clone(),
+            tx_flac.clone(),
+            false,
+        );
     });
 
     let state_row_click = player_state.clone();
@@ -2957,17 +4944,40 @@ fn build_ui(app: &Application) {
     let browsing_lbl_loading = now_browsing_label.clone();
 
     list_box.connect_row_activated(move |_, row| {
-        let index = row.index() as usize;
+        let row_index = row.index();
+        if row_index < 0 {
+            return;
+        }
+        let index = row_index as usize;
         let mut ui = ui_row_click.lock().unwrap();
         let mode = ui.current_view.clone();
 
         match mode {
-            ViewType::Stations | ViewType::Favorites | ViewType::Recent | ViewType::Playlists | ViewType::CustomTag(_) => {
+            ViewType::Stations
+            | ViewType::Favorites
+            | ViewType::Recent
+            | ViewType::Playlists
+            | ViewType::CustomTag(_) => {
                 drop(ui);
-                play_station(&state_row_click, &ui_row_click, index, &ui_play_row_click, &title_row_click, &sub_row_click, &meta_row_click, &info_row_click, &fav_toggle_click, &flag_lbl_row_click, &save_mgr_row_click, &prefs_play_row_click);
+                play_station(
+                    &state_row_click,
+                    &ui_row_click,
+                    index,
+                    &ui_play_row_click,
+                    &title_row_click,
+                    &sub_row_click,
+                    &meta_row_click,
+                    &info_row_click,
+                    &fav_toggle_click,
+                    &flag_lbl_row_click,
+                    &save_mgr_row_click,
+                    &prefs_play_row_click,
+                );
             }
             ViewType::Tags => {
-                let name = ui.categories[index].name.clone();
+                let Some(name) = ui.categories.get(index).map(|item| item.name.clone()) else {
+                    return;
+                };
                 ui.previous_view = Some(ui.current_view.clone());
                 ui.previous_url = ui.last_fetched_url.clone();
                 ui.active_category = CategoryFilter::Tag(name);
@@ -2978,10 +4988,19 @@ fn build_ui(app: &Application) {
                     list_box_loading.remove(&child);
                 }
                 browsing_lbl_loading.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone(), false);
+                fetch_data_async(
+                    url,
+                    true,
+                    ViewType::Stations,
+                    prefs_row_click.clone(),
+                    tx_row_click.clone(),
+                    false,
+                );
             }
             ViewType::Languages => {
-                let name = ui.categories[index].name.clone();
+                let Some(name) = ui.categories.get(index).map(|item| item.name.clone()) else {
+                    return;
+                };
                 ui.previous_view = Some(ui.current_view.clone());
                 ui.previous_url = ui.last_fetched_url.clone();
                 ui.active_category = CategoryFilter::Language(name);
@@ -2992,10 +5011,19 @@ fn build_ui(app: &Application) {
                     list_box_loading.remove(&child);
                 }
                 browsing_lbl_loading.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone(), false);
+                fetch_data_async(
+                    url,
+                    true,
+                    ViewType::Stations,
+                    prefs_row_click.clone(),
+                    tx_row_click.clone(),
+                    false,
+                );
             }
             ViewType::Countries => {
-                let name = ui.categories[index].name.clone();
+                let Some(name) = ui.categories.get(index).map(|item| item.name.clone()) else {
+                    return;
+                };
                 ui.previous_view = Some(ui.current_view.clone());
                 ui.previous_url = ui.last_fetched_url.clone();
                 ui.active_category = CategoryFilter::Country(name);
@@ -3006,7 +5034,14 @@ fn build_ui(app: &Application) {
                     list_box_loading.remove(&child);
                 }
                 browsing_lbl_loading.set_text("Loading stations...");
-                fetch_data_async(url, true, ViewType::Stations, prefs_row_click.clone(), tx_row_click.clone(), false);
+                fetch_data_async(
+                    url,
+                    true,
+                    ViewType::Stations,
+                    prefs_row_click.clone(),
+                    tx_row_click.clone(),
+                    false,
+                );
             }
         }
     });
@@ -3028,9 +5063,27 @@ fn build_ui(app: &Application) {
             let ui = ui_play_pause.lock().unwrap();
             let fb = ui.active_bitrate != BitrateFilterSetting::None;
             let max_len = match ui.current_view {
-                ViewType::Favorites => if fb { ui.stations.len() } else { ui.favorites.len() },
-                ViewType::Recent => if fb { ui.stations.len() } else { ui.recent_stations.len() },
-                ViewType::Playlists => if fb { ui.stations.len() } else { ui.playlists.len() },
+                ViewType::Favorites => {
+                    if fb {
+                        ui.stations.len()
+                    } else {
+                        ui.favorites.len()
+                    }
+                }
+                ViewType::Recent => {
+                    if fb {
+                        ui.stations.len()
+                    } else {
+                        ui.recent_stations.len()
+                    }
+                }
+                ViewType::Playlists => {
+                    if fb {
+                        ui.stations.len()
+                    } else {
+                        ui.playlists.len()
+                    }
+                }
                 _ => ui.stations.len(),
             };
             (ui.current_index, ui.current_view.clone(), max_len)
@@ -3040,13 +5093,33 @@ fn build_ui(app: &Application) {
             match state.pipeline.clone() {
                 Some(pipeline) => {
                     if !state.is_paused {
-                        let _ = pipeline.set_state(gstreamer::State::Paused);
-                        state.is_paused = true;
-                        btn.set_icon_name("media-playback-start-symbolic");
+                        match pipeline.set_state(gstreamer::State::Paused) {
+                            Ok(_) => {
+                                state.is_paused = true;
+                                btn.set_icon_name("media-playback-start-symbolic");
+                            }
+                            Err(err) => {
+                                eprintln!("Failed to pause playback: {}", err);
+                                invalidate_player(&mut state);
+                                btn.set_icon_name("media-playback-start-symbolic");
+                                meta_lbl_ctrl.set_text("(Playback unavailable)");
+                                info_lbl_ctrl.set_text("");
+                            }
+                        }
                     } else {
-                        let _ = pipeline.set_state(gstreamer::State::Playing);
-                        state.is_paused = false;
-                        btn.set_icon_name("media-playback-pause-symbolic");
+                        match pipeline.set_state(gstreamer::State::Playing) {
+                            Ok(_) => {
+                                state.is_paused = false;
+                                btn.set_icon_name("media-playback-pause-symbolic");
+                            }
+                            Err(err) => {
+                                eprintln!("Failed to resume playback: {}", err);
+                                invalidate_player(&mut state);
+                                btn.set_icon_name("media-playback-start-symbolic");
+                                meta_lbl_ctrl.set_text("(Playback unavailable)");
+                                info_lbl_ctrl.set_text("");
+                            }
+                        }
                     }
                 }
                 None => {
@@ -3056,10 +5129,27 @@ fn build_ui(app: &Application) {
         } else {
             drop(state);
             match mode {
-                ViewType::Stations | ViewType::Favorites | ViewType::Recent | ViewType::Playlists | ViewType::CustomTag(_) => {
+                ViewType::Stations
+                | ViewType::Favorites
+                | ViewType::Recent
+                | ViewType::Playlists
+                | ViewType::CustomTag(_) => {
                     if let Some(idx) = current {
                         if idx < max_len {
-                            play_station(&state_play_pause, &ui_play_pause, idx, &btn_play_pause_clone, &np_title_ctrl, &np_sub_ctrl, &meta_lbl_ctrl, &info_lbl_ctrl, &fav_toggle_ctrl, &flag_lbl_ctrl, &save_mgr_play_pause, &prefs_play_pause);
+                            play_station(
+                                &state_play_pause,
+                                &ui_play_pause,
+                                idx,
+                                &btn_play_pause_clone,
+                                &np_title_ctrl,
+                                &np_sub_ctrl,
+                                &meta_lbl_ctrl,
+                                &info_lbl_ctrl,
+                                &fav_toggle_ctrl,
+                                &flag_lbl_ctrl,
+                                &save_mgr_play_pause,
+                                &prefs_play_pause,
+                            );
                         }
                     }
                 }
@@ -3068,7 +5158,8 @@ fn build_ui(app: &Application) {
         }
     });
 
-    let state_prev = player_state.clone(); let ui_prev = ui_state.clone();
+    let state_prev = player_state.clone();
+    let ui_prev = ui_state.clone();
     let list_box_prev = list_box.clone();
     let btn_prev_ui = play_pause_btn.clone();
     let np_title_prev = now_playing_title.clone();
@@ -3085,11 +5176,28 @@ fn build_ui(app: &Application) {
         let current = ui.current_index;
         drop(ui);
         match mode {
-            ViewType::Stations | ViewType::Favorites | ViewType::Recent | ViewType::Playlists | ViewType::CustomTag(_) => {
+            ViewType::Stations
+            | ViewType::Favorites
+            | ViewType::Recent
+            | ViewType::Playlists
+            | ViewType::CustomTag(_) => {
                 if let Some(idx) = current {
                     if idx > 0 {
                         let new_idx = idx - 1;
-                        play_station(&state_prev, &ui_prev, new_idx, &btn_prev_ui, &np_title_prev, &np_sub_prev, &meta_lbl_prev, &info_lbl_prev, &fav_toggle_prev, &flag_lbl_prev, &save_mgr_prev, &prefs_prev);
+                        play_station(
+                            &state_prev,
+                            &ui_prev,
+                            new_idx,
+                            &btn_prev_ui,
+                            &np_title_prev,
+                            &np_sub_prev,
+                            &meta_lbl_prev,
+                            &info_lbl_prev,
+                            &fav_toggle_prev,
+                            &flag_lbl_prev,
+                            &save_mgr_prev,
+                            &prefs_prev,
+                        );
                         if let Some(row) = list_box_prev.row_at_index(new_idx as i32) {
                             list_box_prev.select_row(Some(&row));
                         }
@@ -3100,7 +5208,8 @@ fn build_ui(app: &Application) {
         }
     });
 
-    let state_next = player_state.clone(); let ui_next = ui_state.clone();
+    let state_next = player_state.clone();
+    let ui_next = ui_state.clone();
     let list_box_next = list_box.clone();
     let btn_next_ui = play_pause_btn.clone();
     let np_title_next = now_playing_title.clone();
@@ -3117,18 +5226,53 @@ fn build_ui(app: &Application) {
         let current = ui.current_index;
         let fb = ui.active_bitrate != BitrateFilterSetting::None;
         let stations_len = match mode {
-            ViewType::Favorites => if fb { ui.stations.len() } else { ui.favorites.len() },
-            ViewType::Recent => if fb { ui.stations.len() } else { ui.recent_stations.len() },
-            ViewType::Playlists => if fb { ui.stations.len() } else { ui.playlists.len() },
+            ViewType::Favorites => {
+                if fb {
+                    ui.stations.len()
+                } else {
+                    ui.favorites.len()
+                }
+            }
+            ViewType::Recent => {
+                if fb {
+                    ui.stations.len()
+                } else {
+                    ui.recent_stations.len()
+                }
+            }
+            ViewType::Playlists => {
+                if fb {
+                    ui.stations.len()
+                } else {
+                    ui.playlists.len()
+                }
+            }
             _ => ui.stations.len(),
         };
         drop(ui);
         match mode {
-            ViewType::Stations | ViewType::Favorites | ViewType::Recent | ViewType::Playlists | ViewType::CustomTag(_) => {
+            ViewType::Stations
+            | ViewType::Favorites
+            | ViewType::Recent
+            | ViewType::Playlists
+            | ViewType::CustomTag(_) => {
                 if let Some(idx) = current {
                     if idx + 1 < stations_len {
                         let new_idx = idx + 1;
-                        play_station(&state_next, &ui_next, new_idx, &btn_next_ui, &np_title_next, &np_sub_next, &meta_lbl_next, &info_lbl_next, &fav_toggle_next, &flag_lbl_next, &save_mgr_next, &prefs_next);
+                        play_station(
+                            &state_next,
+                            &ui_next,
+                            new_idx,
+                            &btn_next_ui,
+                            &np_title_next,
+                            &np_sub_next,
+                            &meta_lbl_next,
+                            &info_lbl_next,
+                            &fav_toggle_next,
+                            &flag_lbl_next,
+                            &save_mgr_next,
+                            &prefs_next,
+                        );
                         if let Some(row) = list_box_next.row_at_index(new_idx as i32) {
                             list_box_next.select_row(Some(&row));
                         }
@@ -3142,19 +5286,95 @@ fn build_ui(app: &Application) {
     let state_fav_toggle = player_state.clone();
     let ui_fav_toggle = ui_state.clone();
     let state_fav_toggle_save = app_state_manager.clone();
+    let tx_fav_toggle = tx.clone();
     fav_toggle_btn.connect_clicked(move |btn| {
-        let player = state_fav_toggle.lock().unwrap();
-        if let Some(current_station) = &player.currently_playing_station {
+        let current_station = state_fav_toggle
+            .lock()
+            .unwrap()
+            .currently_playing_station
+            .clone();
+        if let Some(current_station) = current_station {
+            let should_refresh = {
+                let ui = ui_fav_toggle.lock().unwrap();
+                matches!(
+                    ui.current_view,
+                    ViewType::Stations
+                        | ViewType::Favorites
+                        | ViewType::Recent
+                        | ViewType::Playlists
+                        | ViewType::CustomTag(_)
+                )
+            };
+            if should_refresh {
+                begin_request();
+            }
             let mut ui = ui_fav_toggle.lock().unwrap();
-            if let Some(pos) = ui.favorites.iter().position(|f| station_eq(f, current_station)) {
+            if let Some(pos) = ui
+                .favorites
+                .iter()
+                .position(|f| station_eq(f, &current_station))
+            {
                 ui.favorites.remove(pos);
                 btn.set_icon_name("non-starred-symbolic");
             } else {
-                ui.favorites.push(current_station.clone());
+                ui.favorites.push(current_station);
                 btn.set_icon_name("starred-symbolic");
             }
+            let current_view = ui.current_view.clone();
+            let refresh = match current_view {
+                ViewType::Favorites => {
+                    let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                        ui.favorites.clone()
+                    } else {
+                        let filtered =
+                            filter_stations_local(ui.favorites.clone(), ui.active_bitrate);
+                        ui.stations = filtered.clone();
+                        filtered
+                    };
+                    Some((ViewType::Favorites, stations, INITIAL_STATION_LIMIT, false))
+                }
+                ViewType::Recent => {
+                    let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                        ui.recent_stations.clone()
+                    } else {
+                        let filtered =
+                            filter_stations_local(ui.recent_stations.clone(), ui.active_bitrate);
+                        ui.stations = filtered.clone();
+                        filtered
+                    };
+                    Some((ViewType::Recent, stations, INITIAL_STATION_LIMIT, false))
+                }
+                ViewType::Playlists => {
+                    let stations = if ui.active_bitrate == BitrateFilterSetting::None {
+                        ui.playlists.clone()
+                    } else {
+                        let filtered =
+                            filter_stations_local(ui.playlists.clone(), ui.active_bitrate);
+                        ui.stations = filtered.clone();
+                        filtered
+                    };
+                    Some((ViewType::Playlists, stations, INITIAL_STATION_LIMIT, false))
+                }
+                view @ (ViewType::Stations | ViewType::CustomTag(_)) => Some((
+                    view,
+                    ui.stations.clone(),
+                    ui.station_limit,
+                    ui.station_has_more_hint,
+                )),
+                ViewType::Tags | ViewType::Languages | ViewType::Countries => None,
+            };
             drop(ui);
             state_fav_toggle_save.save_data();
+            if let Some((view, stations, limit, has_more_hint)) = refresh {
+                send_local_stations_with_limit_hint(
+                    &tx_fav_toggle,
+                    view,
+                    stations,
+                    String::new(),
+                    limit,
+                    has_more_hint,
+                );
+            }
         }
     });
 
@@ -3183,6 +5403,7 @@ fn build_ui(app: &Application) {
 
     let list_box_clone = list_box.clone();
     let ui_rx = ui_state.clone();
+    let player_rx = player_state.clone();
     let stations_count_label_clone = stations_count_label.clone();
     let now_browsing_label_clone = now_browsing_label.clone();
     let last_updated_label_clone = last_updated_label.clone();
@@ -3197,11 +5418,15 @@ fn build_ui(app: &Application) {
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(data) = rx.recv().await {
-            let is_load_more = matches!(&data, IncomingData::Stations(_, _, true));
+            let request_id = data.request_id();
+            if !is_active_request(request_id) {
+                continue;
+            }
+            let is_load_more = data.is_load_more();
             // For load-more keep the list intact (spinner stays visible) — idle_add_local
             // will wipe it on its first tick, replacing the spinner with real rows.
             // For all other navigations clear immediately and reset scroll.
-            if !is_load_more {
+            if data.changes_list() && !is_load_more {
                 while let Some(child) = list_box_clone.first_child() {
                     list_box_clone.remove(&child);
                 }
@@ -3209,29 +5434,82 @@ fn build_ui(app: &Application) {
             }
 
             match data {
-                IncomingData::Error(msg) => {
+                IncomingData::Error { message, .. } => {
+                    if is_load_more {
+                        if let Some(last_child) = list_box_clone.last_child() {
+                            list_box_clone.remove(&last_child);
+                        }
+                        SCROLL_TO_ROW.store(usize::MAX, Ordering::Release);
+                        let can_retry = {
+                            let mut ui = ui_rx.lock().unwrap();
+                            let can_retry = matches!(ui.current_view, ViewType::Stations | ViewType::CustomTag(_));
+                            if can_retry {
+                                ui.station_limit = ui
+                                    .station_limit
+                                    .saturating_sub(STATION_PAGE_SIZE)
+                                    .max(INITIAL_STATION_LIMIT);
+                            }
+                            can_retry
+                        };
+                        if can_retry {
+                            let retry_row = ActionRow::builder()
+                                .title("Retry Loading More")
+                                .activatable(true)
+                                .build();
+                            let retry_row_for_handler = retry_row.clone();
+                            let tx_retry = tx_categories.clone();
+                            let prefs_retry = app_prefs_categories.clone();
+                            let ui_retry = ui_rx.clone();
+                            let list_retry = list_box_clone.clone();
+                            retry_row.connect_activated(move |_| {
+                                request_more_stations(
+                                    &list_retry,
+                                    &retry_row_for_handler,
+                                    &tx_retry,
+                                    &prefs_retry,
+                                    &ui_retry,
+                                );
+                            });
+                            list_box_clone.append(&retry_row);
+                        }
+                    }
                     br_area_rx.set_visible(true);
                     import_btn_rx.set_visible(false);
                     clear_recents_rx.set_visible(false);
-                    now_browsing_label_clone.set_text(&msg);
+                    now_browsing_label_clone.set_text(&message);
                     stations_count_label_clone.set_text("");
                 }
-                IncomingData::Categories(view_mode, items) => {
+                IncomingData::Stats { sync_time, .. } => {
+                    let mut ui = ui_rx.lock().unwrap();
+                    ui.last_update_timestamp = sync_time.clone();
+                    last_updated_label_clone.set_text(&format!("DB synced: {}", sync_time));
+                    if let Some(ref lbl) = *stats_label_chan.borrow() {
+                        lbl.set_text(&format!(
+                            "Total Working Stations Loaded: {}\nLast Radio-Browser Sync: {}\nTotal Categories / Stations Fetched: {}",
+                            ui.last_stations_updated_count,
+                            ui.last_update_timestamp,
+                            ui.total_elements_fetched,
+                        ));
+                    }
+                    drop(ui);
+                    state_rx_save.save_data();
+                }
+                IncomingData::Categories { view: view_mode, items, .. } => {
                     br_area_rx.set_visible(true);
                     import_btn_rx.set_visible(false);
                     clear_recents_rx.set_visible(false);
                     // For category views there is no meaningful DB sync time;
                     // show the local fetch time instead.
-                    let now = glib::DateTime::now_local().unwrap();
-                    let time_string = now.format("%Y-%m-%d %H:%M:%S").unwrap().to_string();
+                    let time_string = local_time_string();
                     last_updated_label_clone.set_text(&format!("Last update: {}", time_string));
                     let mut ui = ui_rx.lock().unwrap();
                     let is_tags_view = view_mode == ViewType::Tags;
+                    let is_countries_view = view_mode == ViewType::Countries;
                     ui.current_view = view_mode;
                     ui.categories = items.clone();
                     ui.stations.clear();
                     ui.current_index = None;
-                    
+
                     let browsing_text = match ui.current_view {
                         ViewType::Tags => "Browse by Tag",
                         ViewType::Languages => "Browse by Language",
@@ -3261,8 +5539,18 @@ fn build_ui(app: &Application) {
 
                     for item in items {
                         let title_text = item.name.trim().to_string();
+                        let row_title = if is_countries_view {
+                            let flag = country_code_to_flag(&item.countrycode);
+                            if flag.is_empty() {
+                                title_text.clone()
+                            } else {
+                                format!("{} {}", flag, title_text)
+                            }
+                        } else {
+                            title_text.clone()
+                        };
                         let row = ActionRow::builder()
-                            .title(glib::markup_escape_text(&title_text).to_string())
+                            .title(&row_title)
                             .subtitle(format!("{} active stations available", item.stationcount))
                             .activatable(true)
                             .build();
@@ -3394,7 +5682,16 @@ fn build_ui(app: &Application) {
                         list_box_clone.append(&row);
                     }
                 }
-                IncomingData::Stations(stations_list, server_sync_time, is_load_more) => {
+                IncomingData::Stations {
+                    view: response_view,
+                    stations: stations_list,
+                    sync_time: server_sync_time,
+                    is_load_more,
+                    limit,
+                    preserve_index,
+                    has_more_hint,
+                    ..
+                } => {
                     clear_recents_rx.set_visible(false);
                     stations_count_label_clone.set_text("Updating stations...");
                     let mut ui = ui_rx.lock().unwrap();
@@ -3402,21 +5699,28 @@ fn build_ui(app: &Application) {
                         import_btn_rx.set_visible(false);
                     }
                     let display_time = if server_sync_time == "Unknown" || server_sync_time.is_empty() {
-                        let now = glib::DateTime::now_local().unwrap();
-                        now.format("%Y-%m-%d %H:%M:%S").unwrap().to_string()
+                        local_time_string()
                     } else {
                         server_sync_time.clone()
                     };
                     last_updated_label_clone.set_text(&format!("DB synced: {}", display_time));
                     ui.last_update_timestamp = display_time;
                     let prev_view = ui.current_view.clone();
-                    if matches!(ui.current_view, ViewType::Tags | ViewType::Languages | ViewType::Countries) {
-                        ui.current_view = ViewType::Stations;
-                    }
+                    ui.current_view = response_view;
+                    ui.station_limit = clamp_station_limit(limit);
+                    ui.station_has_more_hint = has_more_hint;
                     ui.stations = stations_list.clone();
                     ui.categories.clear();
                     if !is_load_more {
-                        ui.current_index = None;
+                        ui.current_index = if preserve_index {
+                            player_rx
+                                .lock()
+                                .ok()
+                                .and_then(|player| player.currently_playing_station.clone())
+                                .and_then(|playing| ui.stations.iter().position(|station| station_eq(station, &playing)))
+                        } else {
+                            None
+                        };
                     }
                     let working_count = stations_list.iter().filter(|s| s.lastcheckok == 1).count();
                     ui.total_elements_fetched = working_count;
@@ -3449,14 +5753,16 @@ fn build_ui(app: &Application) {
                     let fav_api_uuids: HashSet<String> = ui.favorites.iter().filter(|f| !f.stationuuid.is_empty()).map(|f| f.stationuuid.clone()).collect();
                     let fav_imported: HashSet<(String, String)> = ui.favorites.iter().filter(|f| f.stationuuid.is_empty()).map(|f| (f.url_resolved.clone(), f.name.clone())).collect();
                     let total_stations = stations_list.len();
+                    let current_limit = ui.station_limit;
+                    let can_paginate = matches!(ui.current_view, ViewType::Stations | ViewType::CustomTag(_));
                     drop(ui);
                     state_rx_save.save_data();
 
                     let display_list: Vec<StationDisplay> = stations_list.into_iter().map(|station| {
                         let title_text = station.name.trim().to_string();
-                        let title_escaped = glib::markup_escape_text(&title_text).to_string();
-                        let country_escaped = glib::markup_escape_text(&station.country).to_string();
-                        let tags_escaped = glib::markup_escape_text(&station.tags).to_string();
+                        let title_escaped = title_text.clone();
+                        let country_escaped = station.country.clone();
+                        let tags_escaped = station.tags.clone();
                         let flag_str = country_code_to_flag(&station.countrycode);
                         let mut subtitle = if flag_str.is_empty() {
                             format!("{} | {}", country_escaped, tags_escaped)
@@ -3489,11 +5795,15 @@ fn build_ui(app: &Application) {
                     let tx_load_more = tx_categories.clone();
                     let prefs_load_more = app_prefs_categories.clone();
                     let ui_load_more = ui_rx.clone();
-                    let has_more = total_stations >= station_limit().load(Ordering::Relaxed);
+                    let has_more = can_paginate
+                        && has_more_hint
+                        && current_limit < MAX_STATION_LIMIT;
                     let sw_batch = sw_restore.clone();
-                    let expected_gen = RENDER_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+                    let expected_gen = RENDER_GEN.load(Ordering::Acquire);
                     glib::idle_add_local(move || {
-                        if RENDER_GEN.load(Ordering::Relaxed) != expected_gen {
+                        if !is_active_request(request_id)
+                            || RENDER_GEN.load(Ordering::Acquire) != expected_gen
+                        {
                             SCROLL_TO_ROW.store(usize::MAX, Ordering::Relaxed);
                             return glib::ControlFlow::Break;
                         }
@@ -3527,32 +5837,15 @@ fn build_ui(app: &Application) {
                                     let prefs_lm = prefs_load_more.clone();
                                     let ui_lm = ui_load_more.clone();
                                     let lb_lm = list_box_batch.clone();
+                                    let load_btn_for_handler = load_btn.clone();
                                     load_btn.connect_activated(move |_| {
-                                        while let Some(child) = lb_lm.first_child() {
-                                            lb_lm.remove(&child);
-                                        }
-                                        let loading_row = ActionRow::builder()
-                                            .title("Loading more stations...")
-                                            .activatable(false)
-                                            .build();
-                                        let spinner = gtk::Spinner::builder()
-                                            .valign(gtk::Align::Center)
-                                            .build();
-                                        spinner.set_size_request(16, 16);
-                                        spinner.start();
-                                        loading_row.add_suffix(&spinner);
-                                        lb_lm.append(&loading_row);
-                                        let old_limit = station_limit().load(Ordering::Relaxed);
-                                        SCROLL_TO_ROW.store(old_limit, Ordering::Relaxed);
-                                        let new_limit = old_limit + 50;
-                                        station_limit().store(new_limit, Ordering::Relaxed);
-                                        let ui = ui_lm.lock().unwrap();
-                                        let mut url = ui.last_fetched_url.clone();
-                                        let view = ui.current_view.clone();
-                                        drop(ui);
-                                        let sep = if url.contains('?') { "&" } else { "?" };
-                                        url.push_str(&format!("{}limit={}", sep, new_limit));
-                                        fetch_data_async(url, true, view, prefs_lm.clone(), tx_lm.clone(), true);
+                                        request_more_stations(
+                                            &lb_lm,
+                                            &load_btn_for_handler,
+                                            &tx_lm,
+                                            &prefs_lm,
+                                            &ui_lm,
+                                        );
                                     });
                                     list_box_batch.append(&load_btn);
                                 }
@@ -3624,6 +5917,7 @@ fn build_ui(app: &Application) {
                                 let station_url = data.station.url_resolved.clone();
                                 let station_name = data.station.name.clone();
                                 rm_btn.connect_clicked(move |_| {
+                                    begin_request();
                                     let mut v = ui_for_rm.lock().unwrap();
                                     let pos = if station_uuid.is_empty() {
                                         v.playlists.iter().position(|p| p.url_resolved == station_url && p.name == station_name)
@@ -3632,6 +5926,13 @@ fn build_ui(app: &Application) {
                                     };
                                     if let Some(idx) = pos {
                                         v.playlists.remove(idx);
+                                        v.current_index = None;
+                                        if v.active_bitrate != BitrateFilterSetting::None {
+                                            v.stations = filter_stations_local(
+                                                v.playlists.clone(),
+                                                v.active_bitrate,
+                                            );
+                                        }
                                         drop(v);
                                         save_rm.save_data();
                                         list_box_rm.remove(&row_rm);
@@ -3654,25 +5955,53 @@ fn build_ui(app: &Application) {
     let tx_init = tx.clone();
     let prefs_init = app_prefs.clone();
     let target_url = "https://de1.api.radio-browser.info/json/tags?order=stationcount&reverse=true&hidebroken=true".to_string();
-    fetch_data_async(target_url, false, ViewType::Tags, prefs_init, tx_init, false);
+    fetch_data_async(
+        target_url,
+        false,
+        ViewType::Tags,
+        prefs_init,
+        tx_init,
+        false,
+    );
 
     let ui_cron_tracker = ui_state.clone();
     let prefs_cron_tracker = app_prefs.clone();
     let tx_cron_tracker = tx.clone();
     std::thread::spawn(move || {
-        loop {
+        while !SHUTTING_DOWN.load(Ordering::Acquire) {
             let wants_update = prefs_cron_tracker.lock().unwrap().auto_update;
             if wants_update {
-                let (current_url, view) = {
+                let (current_url, view, limit) = {
                     let ui = ui_cron_tracker.lock().unwrap();
-                    (ui.last_fetched_url.clone(), ui.current_view.clone())
+                    (
+                        ui.last_fetched_url.clone(),
+                        ui.current_view.clone(),
+                        ui.station_limit,
+                    )
                 };
                 // Only auto-refresh live station lists, never local views.
                 if matches!(view, ViewType::Stations | ViewType::CustomTag(_)) {
-                    fetch_data_async(current_url, true, view, prefs_cron_tracker.clone(), tx_cron_tracker.clone(), false);
+                    let current_url = if limit > INITIAL_STATION_LIMIT {
+                        set_url_limit(current_url, limit)
+                    } else {
+                        current_url
+                    };
+                    fetch_data_async_preserve_index(
+                        current_url,
+                        true,
+                        view,
+                        prefs_cron_tracker.clone(),
+                        tx_cron_tracker.clone(),
+                        false,
+                    );
                 }
             }
-            std::thread::sleep(Duration::from_secs(21600));
+            for _ in 0..21600 {
+                if SHUTTING_DOWN.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
     });
 
@@ -3687,11 +6016,12 @@ fn build_ui(app: &Application) {
         let mut heights = wave_heights.lock().unwrap();
         let mut peaks = peak_heights.lock().unwrap();
         let mut decay_counters = peak_decay_counters.lock().unwrap();
-        
+
         if let Some(pipeline) = &state.pipeline {
             if !state.is_paused {
                 if let Some(position_ns) = pipeline.query_position::<gstreamer::ClockTime>() {
-                    time_label_hook.set_text(&format_time(Duration::from_nanos(position_ns.nseconds())));
+                    time_label_hook
+                        .set_text(&format_time(Duration::from_nanos(position_ns.nseconds())));
                 }
 
                 for (i, h) in heights.iter_mut().enumerate() {
@@ -3707,7 +6037,9 @@ fn build_ui(app: &Application) {
                         peaks[i] = (peaks[i] - 1.8).max(4.0);
                     }
                 }
-                drop(heights); drop(peaks); drop(decay_counters);
+                drop(heights);
+                drop(peaks);
+                drop(decay_counters);
                 drawing_analyzer_clone.queue_draw();
 
                 if let Some(sink) = pipeline.property::<Option<gstreamer::Element>>("audio-sink") {
@@ -3732,20 +6064,22 @@ fn build_ui(app: &Application) {
                                 if meta.codec.is_none() {
                                     let mime = structure.name();
                                     meta.codec = match mime.as_str() {
-                                        "audio/mpeg"                                     => Some("MP3".to_string()),
-                                        "audio/x-flac"                                   => Some("FLAC".to_string()),
-                                        "audio/x-vorbis"                                 => Some("Vorbis".to_string()),
-                                        "audio/x-opus"                                   => Some("Opus".to_string()),
-                                        "audio/x-aac" | "audio/aac" | "audio/mp4a-latm" => Some("AAC".to_string()),
-                                        "audio/x-wma"                                    => Some("WMA".to_string()),
-                                        "audio/x-alac"                                   => Some("ALAC".to_string()),
-                                        "audio/x-speex"                                  => Some("Speex".to_string()),
-                                        "audio/x-raw"                                    => Some("PCM".to_string()),
+                                        "audio/mpeg" => Some("MP3".to_string()),
+                                        "audio/x-flac" => Some("FLAC".to_string()),
+                                        "audio/x-vorbis" => Some("Vorbis".to_string()),
+                                        "audio/x-opus" => Some("Opus".to_string()),
+                                        "audio/x-aac" | "audio/aac" | "audio/mp4a-latm" => {
+                                            Some("AAC".to_string())
+                                        }
+                                        "audio/x-wma" => Some("WMA".to_string()),
+                                        "audio/x-alac" => Some("ALAC".to_string()),
+                                        "audio/x-speex" => Some("Speex".to_string()),
+                                        "audio/x-raw" => Some("PCM".to_string()),
                                         other if other.starts_with("audio/") => Some(
                                             other
                                                 .trim_start_matches("audio/x-")
                                                 .trim_start_matches("audio/")
-                                                .to_uppercase()
+                                                .to_uppercase(),
                                         ),
                                         _ => None,
                                     };
@@ -3760,7 +6094,9 @@ fn build_ui(app: &Application) {
                     let meta = state.current_metadata.lock().unwrap();
 
                     // Stream title line
-                    let title_str = meta.stream_title.clone()
+                    let title_str = meta
+                        .stream_title
+                        .clone()
                         .unwrap_or_else(|| "Live Stream".to_string());
                     meta_label_hook.set_text(&format!("♫ {}", title_str));
 
@@ -3796,7 +6132,9 @@ fn build_ui(app: &Application) {
                     *h = 4.0;
                     peaks[i] = (peaks[i] - 1.5).max(4.0);
                 }
-                drop(heights); drop(peaks); drop(decay_counters);
+                drop(heights);
+                drop(peaks);
+                drop(decay_counters);
                 drawing_analyzer_clone.queue_draw();
             }
         } else {
@@ -3805,17 +6143,71 @@ fn build_ui(app: &Application) {
                 *h = 4.0;
                 peaks[i] = (peaks[i] - 1.5).max(4.0);
             }
-            drop(heights); drop(peaks); drop(decay_counters);
+            drop(heights);
+            drop(peaks);
+            drop(decay_counters);
             drawing_analyzer_clone.queue_draw();
         }
         glib::ControlFlow::Continue
     });
 
     let window = ApplicationWindow::builder()
-        .application(app).title("Rust Radio")
-        .default_width(1280).default_height(800)
+        .application(app)
+        .title("Rust Radio")
+        .default_width(1280)
+        .default_height(800)
         .resizable(true)
         .content(&content_box)
         .build();
+    let save_on_close = app_state_manager.clone();
+    let player_on_close = player_state.clone();
+    window.connect_close_request(move |_| {
+        SHUTTING_DOWN.store(true, Ordering::Release);
+        begin_request();
+        if let Ok(mut player) = player_on_close.lock() {
+            invalidate_player(&mut player);
+        }
+        save_on_close.save_data();
+        gtk::glib::Propagation::Proceed
+    });
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_urls_are_limited_to_http_schemes() {
+        assert!(is_allowed_stream_url("https://radio.example/stream"));
+        assert!(is_allowed_stream_url("HTTP://radio.example/stream"));
+        assert!(!is_allowed_stream_url("file:///tmp/music.mp3"));
+        assert!(!is_allowed_stream_url("smb://server/share"));
+        assert!(!is_allowed_stream_url("/tmp/music.mp3"));
+        assert!(!is_allowed_stream_url(
+            "http://user:password@example.test/stream"
+        ));
+        assert!(!is_allowed_stream_url("http://127.0.0.1/stream"));
+        assert!(!is_allowed_stream_url("http://[fc00::1]/stream"));
+        assert!(!is_allowed_stream_url(
+            "http://example.test:not-a-port/stream"
+        ));
+    }
+
+    #[test]
+    fn station_limits_are_parsed_and_bounded() {
+        assert_eq!(
+            parse_url_limit("https://example.test/search?limit=300&order=bitrate"),
+            Some(300)
+        );
+        assert_eq!(
+            parse_url_limit("https://example.test/search?limit=abc"),
+            None
+        );
+        assert_eq!(clamp_station_limit(1), INITIAL_STATION_LIMIT);
+        assert_eq!(
+            clamp_station_limit(MAX_STATION_LIMIT + 1),
+            MAX_STATION_LIMIT
+        );
+    }
 }

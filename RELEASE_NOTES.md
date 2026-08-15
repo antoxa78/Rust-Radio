@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.3.2
+
+### New Features
+- **Country flags in the Countries menu**: Country entries now show their ISO country flag before the country name.
+
+### Reliability & Security
+- Added request cancellation and stale-response protection for navigation, rendering, and playback callbacks.
+- Hardened persistence, playback failure handling, URL validation, pagination, playlist imports, and application shutdown.
+
 ## v1.3.1
 
 ### Bug Fixes
