@@ -1,5 +1,23 @@
 # Release Notes
 
+## v1.4.0
+
+### New Features
+- **Instant station lists**: Station lists are now cached in memory and on disk (`~/.cache/RustRadioGTK/stations/`), so previously visited tags, languages, countries, and searches open immediately — even after a restart. Lists younger than 30 minutes skip the network entirely; older ones are shown right away and refreshed in the background.
+- **Faster "Load More Stations"**: Only the next page is downloaded and appended, instead of re-fetching the entire list. Already-listed stations are skipped if the server order shifted.
+- **Startup network prewarming**: Radio-Browser server discovery and the first connection are prepared while the UI is being built, so the first list opens faster.
+
+### Performance
+- **Much faster list rendering**: The first 30 rows are rendered immediately to fill the window, then the rest in batches of 40. Single-line ellipsized titles/subtitles avoid slow height measurement, with the full text available in a tooltip.
+- **Background refresh keeps your place**: Auto-updates and stale-cache refreshes redraw the list in place, preserving the scroll position, and are skipped entirely when nothing changed.
+- **Saves no longer block the UI**: Favorites, history, playlists, and preferences are serialized and written on a background thread using atomic file replacement.
+
+### Bug Fixes
+- **Bitrates reported in bit/s are normalized**: Entries such as `192000` (instead of `192`) no longer break the bitrate filter or sort order — bounds and ordering are re-applied locally after normalization.
+- **Station names with special characters**: Names, tags, and URLs containing `&`, `<`, or `>` no longer cause Pango markup failures in favorites, recent, playlists, or category rows.
+- **More reliable server discovery**: All mirror reverse lookups run in parallel under a single bounded timeout, concurrent requests share one discovery, and the fallback host is no longer retried on every request.
+- **Gzip-compressed API responses** are now accepted, reducing download size for large station lists.
+
 ## v1.3.2
 
 ### New Features

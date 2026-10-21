@@ -17,11 +17,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+mod station_cache;
+
 fn make_stats_label() -> Rc<RefCell<Option<gtk::Label>>> {
     Rc::new(RefCell::new(None))
 }
 
-static SCROLL_TO_ROW: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RENDER_GEN: AtomicUsize = AtomicUsize::new(0);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -29,8 +30,22 @@ static REQUEST_CANCEL: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static HTTP_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+/// Discovered radio-browser API host, shared by every request. A
+/// `tokio::sync::OnceCell` lets concurrent first requests wait on a single
+/// discovery instead of each starting their own.
+static RADIO_BROWSER_HOST: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+/// Monotonic sequence for saved-data snapshots, so an older snapshot written
+/// by a background thread can never overwrite a newer one.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Serialises saved-data writes; holds the sequence of the last snapshot written.
+static SAVE_WRITE_LOCK: Mutex<u64> = Mutex::new(0);
 
 const INITIAL_STATION_LIMIT: usize = 250;
+/// Rows rendered in the first idle tick, enough to fill the visible window
+/// so the list appears immediately.
+const FIRST_RENDER_BATCH: usize = 30;
+/// Rows rendered per subsequent idle tick.
+const RENDER_BATCH: usize = 40;
 const STATION_PAGE_SIZE: usize = 50;
 const MAX_STATION_LIMIT: usize = 5_000;
 const MAX_API_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -42,7 +57,6 @@ fn begin_request() -> u64 {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::AcqRel);
     ACTIVE_REQUEST_ID.store(request_id, Ordering::Release);
     RENDER_GEN.fetch_add(1, Ordering::AcqRel);
-    SCROLL_TO_ROW.store(usize::MAX, Ordering::Release);
     if let Some(cancel) = REQUEST_CANCEL.get() {
         cancel.send_replace(request_id);
     }
@@ -62,8 +76,23 @@ fn is_active_request(request_id: u64) -> bool {
     ACTIVE_REQUEST_ID.load(Ordering::Acquire) == request_id
 }
 
-fn parse_url_limit(url: &str) -> Option<usize> {
-    let start = url.find("limit=")? + "limit=".len();
+/// Find the start of the value for query parameter `key` (exact name match).
+fn url_param_value_start(url: &str, key: &str) -> Option<usize> {
+    let query_start = url.find('?')? + 1;
+    let mut pos = query_start;
+    for pair in url[query_start..].split('&') {
+        if let Some(rest) = pair.strip_prefix(key) {
+            if rest.starts_with('=') {
+                return Some(pos + key.len() + 1);
+            }
+        }
+        pos += pair.len() + 1;
+    }
+    None
+}
+
+fn parse_url_usize_param(url: &str, key: &str) -> Option<usize> {
+    let start = url_param_value_start(url, key)?;
     let digits: String = url[start..]
         .chars()
         .take_while(char::is_ascii_digit)
@@ -71,19 +100,76 @@ fn parse_url_limit(url: &str) -> Option<usize> {
     digits.parse::<usize>().ok()
 }
 
-fn set_url_limit(mut url: String, limit: usize) -> String {
-    if let Some(pos) = url.find("limit=") {
-        let start = pos + "limit=".len();
+fn set_url_usize_param(mut url: String, key: &str, value: usize) -> String {
+    if let Some(start) = url_param_value_start(&url, key) {
         let end = url[start..]
             .find(|c: char| !c.is_ascii_digit())
             .map(|offset| start + offset)
             .unwrap_or(url.len());
-        url.replace_range(start..end, &limit.to_string());
+        url.replace_range(start..end, &value.to_string());
     } else {
-        let separator = if url.contains('?') { "&" } else { "?" };
-        url.push_str(&format!("{}limit={}", separator, limit));
+        let separator = if url.contains('?') {
+            if url.ends_with('?') || url.ends_with('&') {
+                ""
+            } else {
+                "&"
+            }
+        } else {
+            "?"
+        };
+        url.push_str(&format!("{}{}={}", separator, key, value));
     }
     url
+}
+
+fn parse_url_limit(url: &str) -> Option<usize> {
+    parse_url_usize_param(url, "limit")
+}
+
+fn set_url_limit(url: String, limit: usize) -> String {
+    set_url_usize_param(url, "limit", limit)
+}
+
+fn parse_url_offset(url: &str) -> Option<usize> {
+    parse_url_usize_param(url, "offset")
+}
+
+fn set_url_offset(url: String, offset: usize) -> String {
+    set_url_usize_param(url, "offset", offset)
+}
+
+fn http_client() -> reqwest::Client {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .pool_idle_timeout(Duration::from_secs(120))
+                .build()
+                .expect("Failed to create HTTP client")
+        })
+        .clone()
+}
+
+fn http_runtime() -> &'static tokio::runtime::Runtime {
+    HTTP_RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"))
+}
+
+/// Start radio-browser server discovery and open a connection to the chosen
+/// server in the background, so the first list the user opens doesn't pay
+/// for DNS + reverse lookups + TCP/TLS handshake. Runs in its own task, so
+/// cancelling a navigation request never aborts the discovery half-way.
+fn prewarm_network() {
+    let client = http_client();
+    http_runtime().spawn(async move {
+        let host = resolve_radio_browser_host().await;
+        let _ = client
+            .head(format!("https://{}/json/stats", host))
+            .header("User-Agent", "RustRadio/1.0")
+            .send()
+            .await;
+    });
 }
 
 fn clamp_station_limit(limit: usize) -> usize {
@@ -109,12 +195,65 @@ struct Station {
     countrycode: String,
     #[serde(default)]
     lastcheckok: i32,
+    #[serde(default, deserialize_with = "deserialize_bitrate_kbps")]
     bitrate: Option<u32>,
+}
+
+/// Some radio-browser entries list their bitrate in bit/s (e.g. `192000`)
+/// instead of kbit/s. No real stream comes close to 10,000 kbps, so anything
+/// above that is treated as bit/s and converted.
+const BITRATE_BPS_THRESHOLD: u32 = 10_000;
+
+fn normalize_bitrate_kbps(bitrate: u32) -> u32 {
+    if bitrate > BITRATE_BPS_THRESHOLD {
+        (bitrate + 500) / 1000
+    } else {
+        bitrate
+    }
+}
+
+/// Applied everywhere stations are read: API responses, saved favorites /
+/// recent / playlists, and the station cache.
+fn deserialize_bitrate_kbps<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(deserializer)?.map(normalize_bitrate_kbps))
+}
+
+/// The server filters and sorts by the raw value, so a station listed as
+/// 128000 passes "≥192" and sorts first. After normalizing, re-apply the
+/// request's bitrate bounds and ordering locally.
+fn apply_bitrate_query_locally(url: &str, mut stations: Vec<Station>) -> Vec<Station> {
+    let min = parse_url_usize_param(url, "bitrateMin");
+    let max = parse_url_usize_param(url, "bitrateMax");
+    if min.is_some() || max.is_some() {
+        stations.retain(|station| match station.bitrate {
+            Some(b) => {
+                let b = b as usize;
+                min.is_none_or(|min| b >= min) && max.is_none_or(|max| b <= max)
+            }
+            None => true,
+        });
+    }
+    if url_param_value_start(url, "order").is_some_and(|start| url[start..].starts_with("bitrate")) {
+        let descending = url_param_value_start(url, "reverse")
+            .is_some_and(|start| url[start..].starts_with("true"));
+        // Stable sort: stations with equal bitrate keep the server's order.
+        if descending {
+            stations.sort_by_key(|s| std::cmp::Reverse(s.bitrate.unwrap_or(0)));
+        } else {
+            stations.sort_by_key(|s| s.bitrate.unwrap_or(0));
+        }
+    }
+    stations
 }
 
 struct StationDisplay {
     title_escaped: String,
     subtitle: String,
+    /// Full, unescaped text for the row tooltip (the row itself is one line).
+    tooltip: String,
     station: Station,
     is_fav: bool,
 }
@@ -334,16 +473,77 @@ struct AppState {
     prefs: Arc<Mutex<AppPreferences>>,
 }
 
-impl AppState {
-    fn save_data(&self) {
-        let mut path = gtk::glib::user_config_dir();
-        path.push("RustRadioGTK");
-        if let Err(err) = std::fs::create_dir_all(&path) {
-            eprintln!("Failed to create configuration directory: {}", err);
+/// Write a saved-data snapshot atomically. Writes are serialised, and a
+/// snapshot older than the last one written is skipped.
+fn write_saved_data(seq: u64, data: &SavedData) {
+    let mut last_written = SAVE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seq <= *last_written {
+        return;
+    }
+
+    let mut path = gtk::glib::user_config_dir();
+    path.push("RustRadioGTK");
+    if let Err(err) = std::fs::create_dir_all(&path) {
+        eprintln!("Failed to create configuration directory: {}", err);
+        return;
+    }
+    path.push("saved_data.json");
+
+    let json = match serde_json::to_vec(data) {
+        Ok(json) => json,
+        Err(err) => {
+            eprintln!("Failed to serialize saved data: {}", err);
             return;
         }
-        path.push("saved_data.json");
+    };
 
+    // Keep the previous file intact until the complete replacement is ready.
+    let temp_path = path.with_file_name("saved_data.json.tmp");
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &path)
+    })();
+    match write_result {
+        Ok(()) => *last_written = seq,
+        Err(err) => {
+            eprintln!("Failed to save application data: {}", err);
+            let _ = std::fs::remove_file(temp_path);
+        }
+    }
+}
+
+impl AppState {
+    /// Save synchronously. Use where the write must finish before continuing
+    /// (e.g. application shutdown).
+    fn save_data(&self) {
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+        let data = self.snapshot();
+        write_saved_data(seq, &data);
+    }
+
+    /// Snapshot the state on the calling thread, then serialise and write it
+    /// (including the fsync) on a background thread so the UI isn't blocked.
+    fn save_data_in_background(&self) {
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+        let data = self.snapshot();
+        let spawned = std::thread::Builder::new()
+            .name("save-data".to_string())
+            .spawn(move || write_saved_data(seq, &data));
+        if let Err(err) = spawned {
+            eprintln!("Failed to start background save: {}", err);
+            self.save_data();
+        }
+    }
+
+    fn snapshot(&self) -> SavedData {
         let ui = self.ui.lock().unwrap();
         let favorites = ui.favorites.clone();
         let recent_stations = ui.recent_stations.clone();
@@ -376,7 +576,7 @@ impl AppState {
         .to_string();
         drop(prefs);
 
-        let data = SavedData {
+        SavedData {
             favorites,
             custom_tags,
             active_bitrate,
@@ -392,31 +592,6 @@ impl AppState {
             prefer_high_bitrate,
             hide_broken,
             auto_update,
-        };
-
-        let json = match serde_json::to_vec(&data) {
-            Ok(json) => json,
-            Err(err) => {
-                eprintln!("Failed to serialize saved data: {}", err);
-                return;
-            }
-        };
-
-        // Keep the previous file intact until the complete replacement is ready.
-        let temp_path = path.with_file_name("saved_data.json.tmp");
-        let write_result = (|| -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&temp_path)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-            std::fs::rename(&temp_path, &path)
-        })();
-        if let Err(err) = write_result {
-            eprintln!("Failed to save application data: {}", err);
-            let _ = std::fs::remove_file(temp_path);
         }
     }
 
@@ -732,16 +907,21 @@ fn request_more_stations(
     prefs: &Arc<Mutex<AppPreferences>>,
     ui_lock: &Arc<Mutex<UIState>>,
 ) {
-    let old_limit = {
+    // Fetch only the next page (offset = stations already requested) and
+    // append it, instead of re-downloading and re-rendering the whole list.
+    let (url, view) = {
         let ui = ui_lock.lock().unwrap();
         if !matches!(ui.current_view, ViewType::Stations | ViewType::CustomTag(_)) {
             return;
         }
-        ui.station_limit
+        let offset = ui.station_limit;
+        if offset >= MAX_STATION_LIMIT {
+            return;
+        }
+        let page = STATION_PAGE_SIZE.min(MAX_STATION_LIMIT - offset);
+        let url = set_url_offset(set_url_limit(ui.last_fetched_url.clone(), page), offset);
+        (url, ui.current_view.clone())
     };
-    if old_limit >= MAX_STATION_LIMIT {
-        return;
-    }
 
     list_box.remove(load_row);
     let loading_row = ActionRow::builder()
@@ -754,14 +934,7 @@ fn request_more_stations(
     loading_row.add_suffix(&spinner);
     list_box.append(&loading_row);
 
-    let new_limit = (old_limit + STATION_PAGE_SIZE).min(MAX_STATION_LIMIT);
-    let mut ui = ui_lock.lock().unwrap();
-    ui.station_limit = new_limit;
-    let url = set_url_limit(ui.last_fetched_url.clone(), new_limit);
-    let view = ui.current_view.clone();
-    drop(ui);
     fetch_data_async(url, true, view, prefs.clone(), tx.clone(), true);
-    SCROLL_TO_ROW.store(old_limit, Ordering::Release);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1194,7 +1367,7 @@ fn play_station_internal(
                     if let Some(bitrate) = tags.index::<gstreamer::tags::Bitrate>(0) {
                         meta.bitrate = Some(bitrate.get());
                         #[cfg(debug_assertions)]
-                        eprintln!("🎵 Stream Bitrate Detected: {} kbps", bitrate.get());
+                        eprintln!("🎵 Stream Bitrate Detected: {} kbps", bitrate.get() / 1000);
                     }
                     if meta.codec.is_none() {
                         if let Some(codec) = tags.index::<gstreamer::tags::AudioCodec>(0) {
@@ -1438,6 +1611,22 @@ fn local_time_string() -> String {
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
+/// Escape text for widgets that interpret Pango markup (AdwActionRow titles
+/// and subtitles do by default). Station names, tags and URLs come from the
+/// server or imported playlists and may contain '&', '<', '>'.
+fn markup_text(text: &str) -> String {
+    glib::markup_escape_text(text).to_string()
+}
+
+fn unix_time_local_string(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| glib::DateTime::from_unix_local(secs).ok())
+        .and_then(|time| time.format("%Y-%m-%d %H:%M:%S").ok())
+        .map(|formatted| formatted.to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
 enum IncomingData {
     Categories {
         request_id: u64,
@@ -1453,6 +1642,9 @@ enum IncomingData {
         limit: usize,
         preserve_index: bool,
         has_more_hint: bool,
+        /// Background refresh of a list already on screen: redraw in place,
+        /// keeping the scroll position.
+        keep_scroll: bool,
     },
     Stats {
         request_id: u64,
@@ -1483,6 +1675,16 @@ impl IncomingData {
                 ..
             } | Self::Error {
                 is_load_more: true,
+                ..
+            }
+        )
+    }
+
+    fn keeps_scroll(&self) -> bool {
+        matches!(
+            self,
+            Self::Stations {
+                keep_scroll: true,
                 ..
             }
         )
@@ -1547,6 +1749,7 @@ fn send_local_stations_with_limit_hint(
         limit: clamp_station_limit(limit),
         preserve_index: false,
         has_more_hint,
+        keep_scroll: false,
     };
     send_local_data(tx, data);
 }
@@ -1578,21 +1781,25 @@ async fn send_network_data(
     }
 }
 
-/// Resolve `all.api.radio-browser.info` via DNS, reverse-lookup each IP to
-/// get the actual server hostname, and return a randomly chosen one.
-/// Falls back to `de1.api.radio-browser.info` on any error.
-/// The result is cached after the first successful resolution.
+/// Return the radio-browser API host to use. Discovery runs once per session;
+/// concurrent callers wait on the same discovery. The fallback host is cached
+/// too, so a failed lookup isn't repeated (and waited on) for every request.
 async fn resolve_radio_browser_host() -> String {
-    static CACHED_HOST: OnceLock<String> = OnceLock::new();
+    RADIO_BROWSER_HOST
+        .get_or_init(discover_radio_browser_host)
+        .await
+        .clone()
+}
 
-    if let Some(host) = CACHED_HOST.get() {
-        return host.clone();
-    }
-
+/// Resolve `all.api.radio-browser.info` via DNS, reverse-lookup every IP in
+/// parallel to get the actual server hostnames, and return a randomly chosen
+/// one. Falls back to `de1.api.radio-browser.info` on any error.
+async fn discover_radio_browser_host() -> String {
+    const FALLBACK_HOST: &str = "de1.api.radio-browser.info";
     use std::net::ToSocketAddrs;
 
     let ips = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
             ("all.api.radio-browser.info", 443u16)
                 .to_socket_addrs()
@@ -1606,35 +1813,40 @@ async fn resolve_radio_browser_host() -> String {
         _ => {
             #[cfg(debug_assertions)]
             eprintln!("🌐 Radio-Browser DNS: forward lookup failed, using de1 fallback");
-            return "de1.api.radio-browser.info".to_string();
+            return FALLBACK_HOST.to_string();
         }
     };
 
-    // Reverse-lookup each IP with a bound so one unresponsive resolver cannot
-    // hold every station request indefinitely.
+    // Reverse-lookup all IPs at once, bounded as a whole, so one slow or
+    // unresponsive resolver can't add seconds per server.
+    let mut lookups = tokio::task::JoinSet::new();
+    for ip in ips {
+        lookups.spawn_blocking(move || lookup_addr(&ip));
+    }
     let mut names: Vec<String> = Vec::new();
-    for ip in &ips {
-        let ip = *ip;
-        if let Ok(Ok(Ok(hostname))) = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || lookup_addr(&ip)),
-        )
-        .await
-        {
-            let host = hostname.trim_end_matches('.').to_string();
-            if host.ends_with(".api.radio-browser.info") && !names.contains(&host) {
-                names.push(host);
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(result) = lookups.join_next().await {
+            if let Ok(Ok(hostname)) = result {
+                let host = hostname.trim_end_matches('.').to_string();
+                if host.ends_with(".api.radio-browser.info") && !names.contains(&host) {
+                    names.push(host);
+                }
             }
         }
-    }
+    })
+    .await;
+    // Blocking lookups that are still running finish on their own; their
+    // results are simply ignored.
+    lookups.detach_all();
 
     if names.is_empty() {
         #[cfg(debug_assertions)]
         eprintln!(
             "🌐 Radio-Browser DNS: reverse lookup returned no valid names, using de1 fallback"
         );
-        return "de1.api.radio-browser.info".to_string();
+        return FALLBACK_HOST.to_string();
     }
+    names.sort();
 
     // Pick a server randomly using the current time as a seed.
     use std::collections::hash_map::DefaultHasher;
@@ -1647,7 +1859,6 @@ async fn resolve_radio_browser_host() -> String {
         .subsec_nanos()
         .hash(&mut h);
     let chosen = names[(h.finish() as usize) % names.len()].clone();
-    let _ = CACHED_HOST.set(chosen.clone());
     #[cfg(debug_assertions)]
     eprintln!(
         "🌐 Radio-Browser DNS: discovered {:?}, using {}",
@@ -1726,25 +1937,8 @@ fn fetch_data_async_internal(
         return;
     }
     let mut cancel = request_cancel_receiver(request_id);
-    let client = HTTP_CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client")
-        })
-        .clone();
-    let rt = HTTP_RUNTIME
-        .get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
-    rt.spawn(async move {
-        // Discover the best available server via DNS before building URLs.
-        let host = tokio::select! {
-            host = resolve_radio_browser_host() => host,
-            _ = cancel.changed() => return,
-        };
-        url = with_host(&url, &host);
-
+    let client = http_client();
+    http_runtime().spawn(async move {
         if !is_active_request(request_id) {
             return;
         }
@@ -1754,14 +1948,33 @@ fn fetch_data_async_internal(
             (config.hide_broken, config.prefer_high_bitrate)
         };
 
-        let target_limit = if is_load_more || preserve_index {
-            clamp_station_limit(parse_url_limit(&url).unwrap_or(INITIAL_STATION_LIMIT))
+        // A load-more request carries `offset=` and fetches only the next
+        // page; `target_limit` is the total number of stations requested from
+        // the server once that page is appended.
+        let page_offset = if is_load_more {
+            parse_url_offset(&url)
         } else {
-            INITIAL_STATION_LIMIT
+            None
+        };
+        let (mut request_limit, mut target_limit) = match page_offset {
+            Some(offset) => {
+                let page = parse_url_limit(&url)
+                    .unwrap_or(STATION_PAGE_SIZE)
+                    .clamp(1, STATION_PAGE_SIZE);
+                (page, clamp_station_limit(offset + page))
+            }
+            None => {
+                let limit = if is_load_more || preserve_index {
+                    clamp_station_limit(parse_url_limit(&url).unwrap_or(INITIAL_STATION_LIMIT))
+                } else {
+                    INITIAL_STATION_LIMIT
+                };
+                (limit, limit)
+            }
         };
 
         if is_stations {
-            url = set_url_limit(url, target_limit);
+            url = set_url_limit(url, request_limit);
             let sep = |u: &str| if u.contains('?') { "&" } else { "?" };
             if hide_broken && !url.contains("lastcheckok=") {
                 url.push_str(&format!("{}lastcheckok=1", sep(&url)));
@@ -1769,6 +1982,65 @@ fn fetch_data_async_internal(
             if prefer_high_bitrate && !url.contains("order=") {
                 url.push_str(&format!("{}order=bitrate&reverse=true", sep(&url)));
             }
+        }
+
+        // Station lists: serve from the cache (memory, then disk) before any
+        // network work. A fresh entry needs no request at all; a stale one is
+        // shown immediately and refreshed below.
+        let cache_key = is_stations.then(|| station_cache::key_for(&url));
+        let mut cached: Option<station_cache::CacheEntry> = None;
+        if let Some(key) = cache_key.clone().filter(|_| !is_load_more) {
+            let lookup = tokio::task::spawn_blocking(move || station_cache::get(&key));
+            let entry = tokio::select! {
+                entry = lookup => entry.ok().flatten(),
+                _ = cancel.changed() => return,
+            };
+            if let Some(entry) = entry {
+                if !preserve_index {
+                    let fresh = entry.is_fresh();
+                    if !send_network_data(
+                        &tx,
+                        &mut cancel,
+                        request_id,
+                        IncomingData::Stations {
+                            request_id,
+                            view: target_view.clone(),
+                            stations: entry.stations.clone(),
+                            sync_time: format!("{} (cached)", unix_time_local_string(entry.fetched_at)),
+                            is_load_more: false,
+                            limit: entry.limit,
+                            preserve_index: false,
+                            has_more_hint: entry.has_more,
+                            keep_scroll: false,
+                        },
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    if fresh {
+                        return;
+                    }
+                    // Refresh the same number of stations the user had loaded.
+                    request_limit = clamp_station_limit(entry.limit);
+                    target_limit = request_limit;
+                    url = set_url_limit(url, request_limit);
+                }
+                cached = Some(entry);
+            }
+        }
+        // A background refresh (stale cache or auto-update) redraws in place
+        // and keeps the selection, and is skipped if nothing changed.
+        let is_refresh = cached.is_some();
+
+        // Discover the best available server via DNS before building URLs.
+        let host = tokio::select! {
+            host = resolve_radio_browser_host() => host,
+            _ = cancel.changed() => return,
+        };
+        url = with_host(&url, &host);
+        if !is_active_request(request_id) {
+            return;
         }
 
         let user_agent = "RustRadio/1.0";
@@ -1785,13 +2057,32 @@ fn fetch_data_async_internal(
                     };
                     match parsed {
                         Ok(stations) => {
-                            let has_more_hint = stations.len() >= target_limit;
+                            let has_more_hint = stations.len() >= request_limit;
                             let stations: Vec<Station> =
                                 stations
                                     .into_iter()
                                     .filter(|station| is_allowed_stream_url(&station.url_resolved))
                                     .take(MAX_STATION_LIMIT)
                                     .collect();
+                            let stations = apply_bitrate_query_locally(&url, stations);
+                            if let Some(key) = cache_key.clone() {
+                                let stored = if is_load_more {
+                                    station_cache::append(&key, &stations, target_limit, has_more_hint)
+                                } else {
+                                    station_cache::put(&key, stations.clone(), target_limit, has_more_hint);
+                                    true
+                                };
+                                if stored {
+                                    tokio::task::spawn_blocking(move || station_cache::persist(&key));
+                                }
+                            }
+                            if let Some(previous) = &cached {
+                                if previous.stations == stations && previous.has_more == has_more_hint {
+                                    // Unchanged: the cache timestamp was renewed above;
+                                    // nothing to redraw.
+                                    return;
+                                }
+                            }
                             if !send_network_data(
                                 &tx,
                                 &mut cancel,
@@ -1803,8 +2094,9 @@ fn fetch_data_async_internal(
                                     sync_time: "Unknown".to_string(),
                                     is_load_more,
                                     limit: target_limit,
-                                    preserve_index,
+                                    preserve_index: preserve_index || is_refresh,
                                     has_more_hint,
+                                    keep_scroll: is_refresh,
                                 },
                             )
                             .await
@@ -1849,6 +2141,9 @@ fn fetch_data_async_internal(
                         Err(_e) => {
                             #[cfg(debug_assertions)]
                             eprintln!("Failed to parse stations JSON: {}", _e);
+                            if is_refresh {
+                                return;
+                            }
                             let _ = send_network_data(
                                 &tx,
                                 &mut cancel,
@@ -1866,6 +2161,9 @@ fn fetch_data_async_internal(
                 Err(_e) => {
                     #[cfg(debug_assertions)]
                     eprintln!("Failed to fetch stations: {}", _e);
+                    if is_refresh {
+                        return;
+                    }
                     let _ = send_network_data(
                         &tx,
                         &mut cancel,
@@ -2499,6 +2797,8 @@ fn tag_to_icon(tag: &str) -> &'static str {
 
 fn build_ui(app: &Application) {
     SHUTTING_DOWN.store(false, Ordering::Release);
+    // Start server discovery + connection setup while the UI is being built.
+    prewarm_network();
     adw::init().unwrap();
 
     let provider = gtk::CssProvider::new();
@@ -4462,12 +4762,13 @@ fn build_ui(app: &Application) {
             let br_badge = station
                 .bitrate
                 .map_or(String::new(), |b| format!(" [{} kbps]", b));
+            let full_subtitle = format!("{} | {}{}", station.country, station.tags, br_badge);
             let row = ActionRow::builder()
-                .title(station.name.trim())
-                .subtitle(format!(
-                    "{} | {}{}",
-                    station.country, station.tags, br_badge
-                ))
+                .title(markup_text(station.name.trim()))
+                .subtitle(markup_text(&full_subtitle))
+                .title_lines(1)
+                .subtitle_lines(1)
+                .tooltip_text(format!("{}\n{}", station.name.trim(), full_subtitle))
                 .activatable(true)
                 .build();
             let remove_fav_btn = Button::builder()
@@ -4540,12 +4841,13 @@ fn build_ui(app: &Application) {
             let br_badge = station
                 .bitrate
                 .map_or(String::new(), |b| format!(" [{} kbps]", b));
+            let full_subtitle = format!("{} | {}{}", station.country, station.tags, br_badge);
             let row = ActionRow::builder()
-                .title(station.name.trim())
-                .subtitle(format!(
-                    "{} | {}{}",
-                    station.country, station.tags, br_badge
-                ))
+                .title(markup_text(station.name.trim()))
+                .subtitle(markup_text(&full_subtitle))
+                .title_lines(1)
+                .subtitle_lines(1)
+                .tooltip_text(format!("{}\n{}", station.name.trim(), full_subtitle))
                 .activatable(true)
                 .build();
             list_box_recent.append(&row);
@@ -4661,8 +4963,11 @@ fn build_ui(app: &Application) {
                             drop(vv);
                             for s in stations.iter() {
                                 let row = ActionRow::builder()
-                                    .title(s.name.trim())
-                                    .subtitle(&s.url_resolved)
+                                    .title(markup_text(s.name.trim()))
+                                    .subtitle(markup_text(&s.url_resolved))
+                                    .title_lines(1)
+                                    .subtitle_lines(1)
+                                    .tooltip_text(format!("{}\n{}", s.name.trim(), s.url_resolved))
                                     .activatable(true)
                                     .build();
                                 let rm_btn = Button::builder()
@@ -5423,10 +5728,13 @@ fn build_ui(app: &Application) {
                 continue;
             }
             let is_load_more = data.is_load_more();
+            let keep_scroll = data.keeps_scroll();
             // For load-more keep the list intact (spinner stays visible) — idle_add_local
             // will wipe it on its first tick, replacing the spinner with real rows.
             // For all other navigations clear immediately and reset scroll.
-            if data.changes_list() && !is_load_more {
+            // A background refresh is redrawn in place by the render callback
+            // (clear + rebuild in one tick), so the list never flashes empty.
+            if data.changes_list() && !is_load_more && !keep_scroll {
                 while let Some(child) = list_box_clone.first_child() {
                     list_box_clone.remove(&child);
                 }
@@ -5439,17 +5747,9 @@ fn build_ui(app: &Application) {
                         if let Some(last_child) = list_box_clone.last_child() {
                             list_box_clone.remove(&last_child);
                         }
-                        SCROLL_TO_ROW.store(usize::MAX, Ordering::Release);
                         let can_retry = {
-                            let mut ui = ui_rx.lock().unwrap();
-                            let can_retry = matches!(ui.current_view, ViewType::Stations | ViewType::CustomTag(_));
-                            if can_retry {
-                                ui.station_limit = ui
-                                    .station_limit
-                                    .saturating_sub(STATION_PAGE_SIZE)
-                                    .max(INITIAL_STATION_LIMIT);
-                            }
-                            can_retry
+                            let ui = ui_rx.lock().unwrap();
+                            matches!(ui.current_view, ViewType::Stations | ViewType::CustomTag(_))
                         };
                         if can_retry {
                             let retry_row = ActionRow::builder()
@@ -5492,7 +5792,7 @@ fn build_ui(app: &Application) {
                         ));
                     }
                     drop(ui);
-                    state_rx_save.save_data();
+                    state_rx_save.save_data_in_background();
                 }
                 IncomingData::Categories { view: view_mode, items, .. } => {
                     br_area_rx.set_visible(true);
@@ -5550,7 +5850,7 @@ fn build_ui(app: &Application) {
                             title_text.clone()
                         };
                         let row = ActionRow::builder()
-                            .title(&row_title)
+                            .title(markup_text(&row_title))
                             .subtitle(format!("{} active stations available", item.stationcount))
                             .activatable(true)
                             .build();
@@ -5709,7 +6009,27 @@ fn build_ui(app: &Application) {
                     ui.current_view = response_view;
                     ui.station_limit = clamp_station_limit(limit);
                     ui.station_has_more_hint = has_more_hint;
-                    ui.stations = stations_list.clone();
+                    // Load-more: append only the new page (skipping any station
+                    // already listed, in case the server order shifted).
+                    // Otherwise replace the list.
+                    let (stations_list, row_offset) = if is_load_more {
+                        let existing: HashSet<String> = ui
+                            .stations
+                            .iter()
+                            .filter(|s| !s.stationuuid.is_empty())
+                            .map(|s| s.stationuuid.clone())
+                            .collect();
+                        let new_stations: Vec<Station> = stations_list
+                            .into_iter()
+                            .filter(|s| s.stationuuid.is_empty() || !existing.contains(&s.stationuuid))
+                            .collect();
+                        let row_offset = ui.stations.len();
+                        ui.stations.extend(new_stations.iter().cloned());
+                        (new_stations, row_offset)
+                    } else {
+                        ui.stations = stations_list.clone();
+                        (stations_list, 0)
+                    };
                     ui.categories.clear();
                     if !is_load_more {
                         ui.current_index = if preserve_index {
@@ -5722,7 +6042,7 @@ fn build_ui(app: &Application) {
                             None
                         };
                     }
-                    let working_count = stations_list.iter().filter(|s| s.lastcheckok == 1).count();
+                    let working_count = ui.stations.iter().filter(|s| s.lastcheckok == 1).count();
                     ui.total_elements_fetched = working_count;
                     ui.last_stations_updated_count = working_count;
                     if let Some(ref lbl) = *stats_label_chan.borrow() {
@@ -5752,15 +6072,17 @@ fn build_ui(app: &Application) {
                     let is_playlists_view = matches!(ui.current_view, ViewType::Playlists);
                     let fav_api_uuids: HashSet<String> = ui.favorites.iter().filter(|f| !f.stationuuid.is_empty()).map(|f| f.stationuuid.clone()).collect();
                     let fav_imported: HashSet<(String, String)> = ui.favorites.iter().filter(|f| f.stationuuid.is_empty()).map(|f| (f.url_resolved.clone(), f.name.clone())).collect();
-                    let total_stations = stations_list.len();
+                    let total_stations = ui.stations.len();
                     let current_limit = ui.station_limit;
                     let can_paginate = matches!(ui.current_view, ViewType::Stations | ViewType::CustomTag(_));
                     drop(ui);
-                    state_rx_save.save_data();
+                    // Persist the sync timestamp/count off the UI thread so the
+                    // fsync doesn't delay the first rows.
+                    state_rx_save.save_data_in_background();
 
                     let display_list: Vec<StationDisplay> = stations_list.into_iter().map(|station| {
                         let title_text = station.name.trim().to_string();
-                        let title_escaped = title_text.clone();
+                        let title_escaped = markup_text(&title_text);
                         let country_escaped = station.country.clone();
                         let tags_escaped = station.tags.clone();
                         let flag_str = country_code_to_flag(&station.countrycode);
@@ -5779,7 +6101,9 @@ fn build_ui(app: &Application) {
                         } else {
                             fav_api_uuids.contains(&station.stationuuid)
                         };
-                        StationDisplay { title_escaped, subtitle, station, is_fav }
+                        let tooltip = format!("{}\n{}", title_text, subtitle);
+                        let subtitle = markup_text(&subtitle);
+                        StationDisplay { title_escaped, subtitle, tooltip, station, is_fav }
                     }).collect();
 
                     let display_rc = std::rc::Rc::new(display_list);
@@ -5798,26 +6122,58 @@ fn build_ui(app: &Application) {
                     let has_more = can_paginate
                         && has_more_hint
                         && current_limit < MAX_STATION_LIMIT;
+                    // New generation so an older render of the same request (e.g.
+                    // the cached list still being drawn when its refresh arrives)
+                    // stops appending rows.
+                    let expected_gen = RENDER_GEN.fetch_add(1, Ordering::AcqRel) + 1;
                     let sw_batch = sw_restore.clone();
-                    let expected_gen = RENDER_GEN.load(Ordering::Acquire);
-                    glib::idle_add_local(move || {
+                    // HIGH_IDLE runs ahead of GTK's layout/redraw (but after input
+                    // events and timers), so all batches are built before the next
+                    // frame: one layout pass instead of one per batch, and the
+                    // list can't be starved by other redraws (e.g. the analyzer).
+                    glib::idle_add_local_full(glib::Priority::HIGH_IDLE, move || {
                         if !is_active_request(request_id)
                             || RENDER_GEN.load(Ordering::Acquire) != expected_gen
                         {
-                            SCROLL_TO_ROW.store(usize::MAX, Ordering::Relaxed);
                             return glib::ControlFlow::Break;
                         }
-                        // On load-more: wipe the spinner row on the very first tick,
-                        // right before appending the first real rows. This keeps the
-                        // spinner visible during the network wait and replaces it
-                        // atomically with rendered content.
+                        // On load-more: remove the spinner row (everything after the
+                        // existing station rows) on the first tick, right before
+                        // appending the new rows. Existing rows stay untouched.
                         if is_load_more && current_idx.get() == 0 {
-                            while let Some(child) = list_box_batch.first_child() {
-                                list_box_batch.remove(&child);
+                            while let Some(last) = list_box_batch.last_child() {
+                                let index = last
+                                    .downcast_ref::<gtk::ListBoxRow>()
+                                    .map(|row| row.index())
+                                    .unwrap_or(-1);
+                                if index >= 0 && (index as usize) < row_offset {
+                                    break;
+                                }
+                                list_box_batch.remove(&last);
                             }
                         }
                         let max = display_rc.len();
-                        for _ in 0..10 {
+                        // Background refresh: swap the whole list in one tick so
+                        // the scroll position survives.
+                        let saved_scroll = if keep_scroll && current_idx.get() == 0 {
+                            let value = sw_batch.vadjustment().value();
+                            while let Some(child) = list_box_batch.first_child() {
+                                list_box_batch.remove(&child);
+                            }
+                            Some(value)
+                        } else {
+                            None
+                        };
+                        // Fill the visible window on the first tick, then render
+                        // the rest in larger batches.
+                        let batch = if keep_scroll {
+                            usize::MAX
+                        } else if current_idx.get() == 0 {
+                            FIRST_RENDER_BATCH
+                        } else {
+                            RENDER_BATCH
+                        };
+                        for _ in 0..batch {
                             let idx = current_idx.get();
                             if idx >= max {
                                 if let Some(text) = browsing_final.as_ref() {
@@ -5849,33 +6205,29 @@ fn build_ui(app: &Application) {
                                     });
                                     list_box_batch.append(&load_btn);
                                 }
-                                let scroll_idx = SCROLL_TO_ROW.swap(usize::MAX, Ordering::Relaxed);
-                                if scroll_idx != usize::MAX && scroll_idx < display_rc.len() {
-                                    let lb_scroll = list_box_batch.clone();
-                                    let sw_scroll = sw_batch.clone();
-                                    let retries = std::cell::Cell::new(0);
-                                    glib::timeout_add_local(Duration::from_millis(50), move || {
-                                        if let Some(row) = lb_scroll.row_at_index(scroll_idx as i32) {
-                                            let y = row.allocation().y() as f64;
-                                            if y > 0.0 {
-                                                sw_scroll.vadjustment().set_value(y);
-                                                return glib::ControlFlow::Break;
-                                            }
-                                        }
-                                        retries.set(retries.get() + 1);
-                                        if retries.get() < 10 {
-                                            glib::ControlFlow::Continue
-                                        } else {
-                                            glib::ControlFlow::Break
+                                if let Some(value) = saved_scroll {
+                                    let adjustment = sw_batch.vadjustment();
+                                    adjustment.set_value(value);
+                                    // Re-apply after layout in case the new list
+                                    // height wasn't known yet.
+                                    glib::timeout_add_local_once(Duration::from_millis(30), move || {
+                                        if (adjustment.value() - value).abs() > 0.5 {
+                                            adjustment.set_value(value);
                                         }
                                     });
                                 }
                                 return glib::ControlFlow::Break;
                             }
                             let data = &display_rc[idx];
+                            // Single-line title/subtitle (ellipsized): wrapping labels
+                            // need height-for-width measuring, which made laying out
+                            // a 250-row list ~10x slower. Full text is in the tooltip.
                             let row = ActionRow::builder()
                                 .title(&data.title_escaped)
                                 .subtitle(&data.subtitle)
+                                .title_lines(1)
+                                .subtitle_lines(1)
+                                .tooltip_text(&data.tooltip)
                                 .activatable(true)
                                 .build();
                             let fav_icon = if data.is_fav { "starred-symbolic" } else { "non-starred-symbolic" };
@@ -6192,6 +6544,53 @@ mod tests {
         assert!(!is_allowed_stream_url(
             "http://example.test:not-a-port/stream"
         ));
+    }
+
+    #[test]
+    fn bitrates_in_bps_are_converted() {
+        let json = r#"[
+            {"stationuuid":"a","name":"A","url_resolved":"https://a.example/s","tags":"","country":"","bitrate":192000},
+            {"stationuuid":"b","name":"B","url_resolved":"https://b.example/s","tags":"","country":"","bitrate":320},
+            {"stationuuid":"c","name":"C","url_resolved":"https://c.example/s","tags":"","country":"","bitrate":128000},
+            {"stationuuid":"d","name":"D","url_resolved":"https://d.example/s","tags":"","country":"","bitrate":null},
+            {"stationuuid":"e","name":"E","url_resolved":"https://e.example/s","tags":"","country":""}
+        ]"#;
+        let stations: Vec<Station> = serde_json::from_str(json).unwrap();
+        let rates: Vec<Option<u32>> = stations.iter().map(|s| s.bitrate).collect();
+        assert_eq!(rates, [Some(192), Some(320), Some(128), None, None]);
+        assert_eq!(normalize_bitrate_kbps(10_000), 10_000);
+        assert_eq!(normalize_bitrate_kbps(127_999), 128);
+
+        // "High" filter + bitrate order: the 128000-bps station is dropped and
+        // the 192000-bps one sorts below 320 kbps.
+        let url = "https://h/json/stations/search?bitrateMin=192&order=bitrate&reverse=true&limit=250";
+        let ids: Vec<String> = apply_bitrate_query_locally(url, stations.clone())
+            .into_iter()
+            .map(|s| s.stationuuid)
+            .collect();
+        assert_eq!(ids, ["b", "a", "d", "e"]);
+        // No filter / order params: untouched.
+        let same = apply_bitrate_query_locally("https://h/json/stations/byname/x", stations.clone());
+        assert_eq!(same, stations);
+    }
+
+    #[test]
+    fn page_params_are_set_and_replaced() {
+        let base = "https://h/json/stations/search?tag=rock&order=bitrate&reverse=true".to_string();
+        let url = set_url_offset(set_url_limit(base, 50), 250);
+        assert_eq!(parse_url_limit(&url), Some(50));
+        assert_eq!(parse_url_offset(&url), Some(250));
+        let url = set_url_offset(url, 300);
+        assert_eq!(parse_url_offset(&url), Some(300));
+        assert_eq!(url.matches("offset=").count(), 1);
+        // A search-term value containing "limit=" must not be mistaken for the param.
+        let url = "https://h/s?name=xlimit=9&limit=20";
+        assert_eq!(parse_url_limit(url), Some(20));
+        // Trailing '&' (as produced by build_filtered_url bases) gets no extra separator.
+        assert_eq!(
+            set_url_limit("https://h/s?tag=a&".to_string(), 5),
+            "https://h/s?tag=a&limit=5"
+        );
     }
 
     #[test]
