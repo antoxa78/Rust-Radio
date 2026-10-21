@@ -3695,11 +3695,16 @@ fn build_ui(app: &Application) {
             .subtitle(option_env!("BUILD_DATETIME").unwrap_or("unknown"))
             .activatable(true)
             .build();
-        let parent_window = window_parent_hook.root().unwrap().downcast::<gtk::Window>().unwrap();
+        // About is opened from Preferences, so it must be transient for the
+        // Preferences window (not the main window). Otherwise clicking
+        // Preferences raises it above this modal dialog, hiding the dialog
+        // while it still blocks all input.
+        let parent_window = prefs_window.clone();
         about_row.connect_activated(move |_| {
             let dialog = gtk::Window::builder()
                 .title("About")
                 .transient_for(&parent_window)
+                .destroy_with_parent(true)
                 .modal(true)
                 .default_width(420)
                 .default_height(360)

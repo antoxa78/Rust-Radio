@@ -1,5 +1,10 @@
 # Release Notes
 
+## v1.4.1
+
+### Bug Fixes
+- **About dialog no longer disappears behind Preferences**: The About dialog is now transient for the Preferences window it is opened from (and closes with it). Previously, clicking Preferences could raise it above the modal About dialog, hiding it while it still blocked all input — making the app appear frozen.
+
 ## v1.4.0
 
 ### New Features
