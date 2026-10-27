@@ -6,43 +6,68 @@ Built with [Rust](https://www.rust-lang.org/) · [GTK4](https://gtk.org/) · [li
 
 ## Features
 
-- Browse stations by **tag**, **language**, or **country**
-- **Search** stations by name
-- **Top Voted** stations
-- **Favorites** and **Recently Played** history (persisted to disk)
+- Browse stations by **tag**, **language**, or **country**, plus **Top Voted** and **Search**
+- **Favourites** and **Recently Played** history (only stations that actually played)
 - **Custom tags** — pin frequently used tags to the sidebar
-- **Playlist import** (M3U/PLS)
-- **Bitrate filtering** (Any / Low ≤160 / High ≥192 / FLAC)
-- Sort by name (A–Z / Z–A)
-- Auto-update background refresh (configurable, 6h interval)
-- **Batch-rendered lists** — station rows rendered in small idle batches for a smooth, responsive UI even with 250 stations
-- **Cached categories** — tags, languages, and countries cached after first fetch
+- **Playlist import** (M3U, M3U8, PLS — format detected from the content)
+- **Bitrate filtering** (Any / Low ≤160 / High ≥192 / FLAC) and A–Z / Z–A sorting
+- **Real spectrum analyzer** driven by the audio (four styles)
+- **Media keys & desktop media controls** via MPRIS (GNOME, KDE, `playerctl`)
+- **Keyboard shortcuts** — Space play/stop, Ctrl+←/→ previous/next, Ctrl+F search, Ctrl+D favourite, Alt+← back (Ctrl+? shows them all)
+- **Resilient networking** — automatic failover between radio-browser mirrors, retry on errors, auto-skip of dead stations and reconnect when a stream drops
+- **Instant lists** — station lists cached in memory and on disk, refreshed in the background
+- Auto-update of the open list (configurable, 6 h interval)
+- Backup / restore of favourites, playlists and tags
+- Optional playback of streams on your **local network** (Preferences › Audio)
 
 ## Build from source
 
 ### Dependencies
 
-- Rust 2021 edition
-- GTK4, libadwaita (0.7), GStreamer, and their development headers
+- Rust (stable, 1.82 or newer)
+- GTK ≥ 4.10, libadwaita ≥ 1.5, GStreamer ≥ 1.20 with *gst-plugins-good*, and their development headers
+  (Ubuntu 24.04+, Debian 13+, Fedora 40+)
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt install rustc cargo libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev
+sudo apt install rustc cargo libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly
 ```
 
-### Build
+### Build & test
 
 ```bash
 cargo build --release
+cargo test
 ```
+
+To develop against a different (or mock) radio-browser server, set
+`RUST_RADIO_API=http://127.0.0.1:8080` before starting the app.
+
+### Code layout
+
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | Startup (single instance) |
+| `src/api.rs` | radio-browser client, mirror discovery & failover, query building |
+| `src/player.rs` | GStreamer playback, spectrum, buffering |
+| `src/mpris.rs` | MPRIS2 D-Bus interface |
+| `src/model.rs` | Station / view types, filters |
+| `src/playlist.rs` | M3U / PLS import |
+| `src/net_safety.rs` | Stream URL validation |
+| `src/persistence.rs` | Saved settings, favourites, history |
+| `src/station_cache.rs` | Memory + disk cache of station lists |
+| `src/icons.rs` | Tag → icon mapping |
+| `src/ui/` | Window, navigation, preferences, analyzer drawing |
 
 ## Install
 
 ### Debian package
 
 ```bash
+cargo install cargo-deb   # once
 cargo deb
-sudo dpkg -i target/debian/rust-radio_0.1.8-1_amd64.deb
+sudo dpkg -i target/debian/rust-radio_*_amd64.deb
 ```
 
 ### Manual

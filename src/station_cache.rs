@@ -15,7 +15,7 @@
 //! The caller decides freshness: a fresh entry is shown without touching the
 //! network; a stale one is shown immediately and refreshed in the background.
 
-use crate::Station;
+use crate::model::Station;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
@@ -34,7 +34,8 @@ const MAX_ENTRIES: usize = 40;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Bump when the on-disk format changes; older files are then ignored.
 /// 2: bitrates normalized to kbps and re-sorted (older lists may be misordered).
-const FORMAT_VERSION: u32 = 2;
+/// 3: queries switched to `hidebroken`/`codec` and stations carry `codec`.
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -309,6 +310,7 @@ mod tests {
             countrycode: "NW".to_string(),
             lastcheckok: 1,
             bitrate: Some(128),
+            codec: "MP3".to_string(),
         }
     }
 
@@ -364,7 +366,11 @@ mod tests {
         put(key, vec![station("a"), station("b")], 250, true);
         assert!(append(key, &[station("b"), station("c")], 300, false));
         let entry = get(key).unwrap();
-        let uuids: Vec<&str> = entry.stations.iter().map(|s| s.stationuuid.as_str()).collect();
+        let uuids: Vec<&str> = entry
+            .stations
+            .iter()
+            .map(|s| s.stationuuid.as_str())
+            .collect();
         assert_eq!(uuids, ["a", "b", "c"]);
         assert_eq!(entry.limit, 300);
         assert!(!entry.has_more);

@@ -1,5 +1,39 @@
 # Release Notes
 
+## v1.5.0
+
+### New Features
+- **Real spectrum analyzer**: the bars now follow the actual audio (GStreamer `spectrum`), instead of random values.
+- **Media keys & desktop media controls (MPRIS)**: play/stop, next/previous, volume and "now playing" in GNOME/KDE and `playerctl`.
+- **Keyboard shortcuts**: Space, Ctrl+←/→, Ctrl+F, Ctrl+D, Alt+←, Ctrl+, , Ctrl+Q; Ctrl+? shows the list.
+- **Allow Local Network Streams** option for home Icecast/Snapcast servers.
+- **Mirror failover**: if a radio-browser server fails, the next one is tried automatically.
+- **Click counting**: plays are reported to radio-browser (as its API guidelines ask), with a versioned User-Agent.
+- Window size and maximized state are remembered; Back now remembers several steps.
+- New About dialog and a "Keyboard Shortcuts" window; errors show a Retry button; toasts confirm imports, backups and favourites (with Undo for Clear Recents).
+
+### Bug Fixes
+- **Recent view played the wrong station** after the first click (the list re-ordered behind the rows).
+- **"Hide Broken Stations" had no effect** — the app sent an unsupported `lastcheckok` parameter; it now uses `hidebroken`.
+- **"Prefer High Bitrate" had no effect** on tag/language/country lists; turning it off now sorts by popularity.
+- **Launching the app twice opened a second, independent window** (two players, data overwriting each other); it now raises the existing window.
+- Offline/DNS failures no longer claim the stream "resolves to a local/private address"; browsing while a station is connecting no longer cancels playback.
+- A failing station skips to the next one at most 3 times, and only stations that actually played are added to Recent; a dropped stream reconnects up to 2 times.
+- Stop/Play on live radio reconnects instead of resuming a stale, possibly dropped connection.
+- Saving no longer blocks the UI (all saves are written in the background).
+- A–Z sort no longer permanently re-orders your play history; "Clear Recents" no longer disappears.
+- Playlist import: `.m3u8` files, files starting with a BOM, and `#EXTINF` lines with commas inside attributes now import correctly; skipped entries are reported.
+- Backup/restore errors are reported instead of silently ignored.
+- FLAC filter uses the codec; country lists match exactly (Niger ≠ Nigeria).
+- Tag icons match whole words ("spanish" no longer gets the spa icon, "Alaska" no longer gets ska).
+- Play time shows hours (`2:01:40`) after the first hour.
+- Local-address checks now also cover CGNAT/Tailscale, multicast, reserved and NAT64 ranges.
+
+### Under the Hood
+- `main.rs` (6,600 lines) split into focused modules; duplicated handlers removed.
+- Upgraded to GStreamer bindings 0.23 (one copy of glib instead of two), slimmer Tokio features, current GTK/libadwaita APIs (`FileDialog`, `PreferencesDialog`, `AlertDialog`, `AboutDialog`).
+- Test suite grew from 7 to 25+ tests.
+
 ## v1.4.1
 
 ### Bug Fixes

@@ -1,6 +1,6 @@
 [package]
 name = "rust-radio"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "A GTK4 internet radio player using radio-browser.info"
 authors = ["Rust Radio"]
@@ -28,18 +28,16 @@ depends = "$auto"
 
 [dependencies]
 # UI Stack
-gtk = { version = "0.9", package = "gtk4" }
-adw = { version = "0.7", package = "libadwaita" }
-glib = "0.19"
+gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
 
 # Media Engine
-gstreamer = "0.22"
+gstreamer = "0.23"
 
 # Networking & Async
 reqwest = { version = "0.12", features = ["json", "gzip"] }
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.0", features = ["full"] }
-urlencoding = "2.1"
-async-channel = "2.3"
 serde_json = "1.0.149"
+tokio = { version = "1.0", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+urlencoding = "2.1"
 dns-lookup = "2.0"
