@@ -11,7 +11,7 @@ Built with [Rust](https://www.rust-lang.org/) · [GTK4](https://gtk.org/) · [li
 - **Custom tags** — pin frequently used tags to the sidebar
 - **Playlist import** (M3U, M3U8, PLS — format detected from the content)
 - **Bitrate filtering** (Any / Low ≤160 / High ≥192 / FLAC) and A–Z / Z–A sorting
-- **Real spectrum analyzer** driven by the audio (four styles)
+- **Real spectrum analyzer** driven by the audio (four styles, can be disabled in Preferences)
 - **Media keys & desktop media controls** via MPRIS (GNOME, KDE, `playerctl`)
 - **Keyboard shortcuts** — Space play/stop, Ctrl+←/→ previous/next, Ctrl+F search, Ctrl+D favourite, Alt+← back (Ctrl+? shows them all)
 - **Resilient networking** — automatic failover between radio-browser mirrors, retry on errors, auto-skip of dead stations and reconnect when a stream drops

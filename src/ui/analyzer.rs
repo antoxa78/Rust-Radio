@@ -4,6 +4,7 @@
 use crate::model::AnalyzerType;
 use crate::player::{SPECTRUM_BANDS, SPECTRUM_THRESHOLD_DB};
 use gtk::prelude::*;
+use std::sync::OnceLock;
 
 pub const BARS: usize = 64;
 /// Bar heights live in [FLOOR, CEIL] (units of the drawing code, 50 = full).
@@ -31,25 +32,45 @@ impl Default for Analyzer {
     }
 }
 
+struct BandRanges {
+    lo: [f64; BARS],
+    hi: [f64; BARS],
+}
+
+/// Log-spaced bar edges are fixed, so compute them once instead of doing
+/// 64 `powf` calls for every spectrum frame (20 per second).
+fn band_ranges() -> &'static BandRanges {
+    static RANGES: OnceLock<BandRanges> = OnceLock::new();
+    RANGES.get_or_init(|| {
+        let ratio = (MAX_HZ / MIN_HZ).powf(1.0 / BARS as f64);
+        let mut ranges = BandRanges {
+            lo: [0.0; BARS],
+            hi: [0.0; BARS],
+        };
+        for bar in 0..BARS {
+            let lo = MIN_HZ * ratio.powi(bar as i32);
+            ranges.lo[bar] = lo;
+            ranges.hi[bar] = lo * ratio;
+        }
+        ranges
+    })
+}
+
 /// Group linear FFT bands into `BARS` log-spaced bars (max dB per bar).
-pub fn bars_from_magnitudes(magnitudes: &[f32], sample_rate: f64) -> Vec<f64> {
+pub fn bars_from_magnitudes(magnitudes: &[f32], sample_rate: f64) -> [f64; BARS] {
     let bands = magnitudes.len().max(1);
     let band_hz = (sample_rate / 2.0) / bands as f64;
-    let ratio = (MAX_HZ / MIN_HZ).powf(1.0 / BARS as f64);
-    (0..BARS)
-        .map(|bar| {
-            let lo_hz = MIN_HZ * ratio.powi(bar as i32);
-            let hi_hz = lo_hz * ratio;
-            let lo = ((lo_hz / band_hz) as usize).min(bands - 1);
-            let hi = ((hi_hz / band_hz).ceil() as usize).clamp(lo + 1, bands);
-            let db = magnitudes[lo..hi]
-                .iter()
-                .copied()
-                .fold(SPECTRUM_THRESHOLD_DB as f32, f32::max) as f64;
-            let level = ((db - DB_LOW) / (DB_HIGH - DB_LOW)).clamp(0.0, 1.0);
-            FLOOR + level * (CEIL - FLOOR)
-        })
-        .collect()
+    let ranges = band_ranges();
+    std::array::from_fn(|bar| {
+        let lo = ((ranges.lo[bar] / band_hz) as usize).min(bands - 1);
+        let hi = ((ranges.hi[bar] / band_hz).ceil() as usize).clamp(lo + 1, bands);
+        let db = magnitudes[lo..hi]
+            .iter()
+            .copied()
+            .fold(SPECTRUM_THRESHOLD_DB as f32, f32::max) as f64;
+        let level = ((db - DB_LOW) / (DB_HIGH - DB_LOW)).clamp(0.0, 1.0);
+        FLOOR + level * (CEIL - FLOOR)
+    })
 }
 
 impl Analyzer {
@@ -75,6 +96,13 @@ impl Analyzer {
                 self.peaks[i] = (self.peaks[i] - 1.8).max(FLOOR);
             }
         }
+    }
+
+    /// Clear the bars, e.g. after the visualizer was hidden for a while.
+    pub fn reset(&mut self) {
+        self.heights.fill(FLOOR);
+        self.peaks.fill(FLOOR);
+        self.hold.fill(0);
     }
 
     /// One step of the fall-off animation used when nothing is playing.

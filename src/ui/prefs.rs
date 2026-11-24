@@ -93,6 +93,11 @@ pub fn show_preferences(app: &Rc<App>) {
     });
     stations.add(&auto);
 
+    let analyzer_enabled = switch_row(
+        "Show Spectrum Analyzer",
+        Some("Live audio visualization in the player bar"),
+        p.analyzer_enabled,
+    );
     let analyzer_model = gtk::StringList::new(&AnalyzerType::ALL.map(|a| a.label()));
     let analyzer = adw::ComboRow::builder()
         .title("Spectrum Analyzer Style")
@@ -103,7 +108,25 @@ pub fn show_preferences(app: &Rc<App>) {
                 .position(|a| *a == p.analyzer_type)
                 .unwrap_or(2) as u32,
         )
+        .sensitive(p.analyzer_enabled)
         .build();
+    let me = app.clone();
+    let style_row = analyzer.clone();
+    analyzer_enabled.connect_active_notify(move |row| {
+        let enabled = row.is_active();
+        me.prefs.borrow_mut().analyzer_enabled = enabled;
+        me.w.analyzer.set_visible(enabled);
+        me.player.set_spectrum_enabled(enabled);
+        style_row.set_sensitive(enabled);
+        if enabled {
+            me.analyzer.borrow_mut().reset();
+            me.w.analyzer.queue_draw();
+        } else {
+            me.stop_decay();
+        }
+        me.save();
+    });
+    stations.add(&analyzer_enabled);
     let me = app.clone();
     analyzer.connect_selected_notify(move |row| {
         if let Some(kind) = AnalyzerType::ALL.get(row.selected() as usize) {
@@ -209,15 +232,35 @@ pub fn show_preferences(app: &Rc<App>) {
 
     // --- Statistics
     let stats = adw::PreferencesGroup::builder().title("Statistics").build();
-    stats.add(
-        &gtk::Label::builder()
-            .label(app.stats_text())
-            .css_classes(vec!["caption".to_string()])
-            .halign(gtk::Align::Start)
-            .wrap(true)
-            .build(),
-    );
+    let stats_label = gtk::Label::builder()
+        .label(app.stats_text())
+        .css_classes(vec!["caption".to_string()])
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .build();
+    stats.add(&stats_label);
     page.add(&stats);
+
+    // The label above is only a snapshot; keep it live while the dialog is
+    // open so "Sync" (and background refreshes) show up immediately.
+    let weak_app = Rc::downgrade(app);
+    let label = stats_label.clone();
+    let open_dialog = dialog.clone();
+    let mut last_text = stats_label.text().to_string();
+    glib::timeout_add_seconds_local(1, move || {
+        let Some(app) = weak_app.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if !open_dialog.is_visible() {
+            return glib::ControlFlow::Break;
+        }
+        let text = app.stats_text();
+        if text != last_text {
+            label.set_text(&text);
+            last_text = text;
+        }
+        glib::ControlFlow::Continue
+    });
 
     dialog.add(&page);
     dialog.present(Some(&app.w.window));

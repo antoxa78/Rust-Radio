@@ -41,6 +41,8 @@ pub struct PlayOptions {
     pub prebuffer: bool,
     pub bitrate_kbps: Option<u32>,
     pub volume: f64,
+    /// Attach the `spectrum` element used by the visualizer.
+    pub spectrum: bool,
 }
 
 type EventCallback = Rc<dyn Fn(PlayerEvent)>;
@@ -50,6 +52,17 @@ struct Inner {
     pipeline: Option<gst::Element>,
     bus_guard: Option<gst::bus::BusWatchGuard>,
     safety_timeout: Option<glib::SourceId>,
+    spectrum: Option<gst::Element>,
+}
+
+fn make_spectrum() -> Option<gst::Element> {
+    gst::ElementFactory::make("spectrum")
+        .property("bands", SPECTRUM_BANDS)
+        .property("threshold", SPECTRUM_THRESHOLD_DB)
+        .property("interval", 50_000_000u64)
+        .property("post-messages", true)
+        .build()
+        .ok()
 }
 
 pub struct Player {
@@ -107,6 +120,29 @@ impl Player {
         }
         if let Some(pipeline) = inner.pipeline.take() {
             let _ = pipeline.set_state(gst::State::Null);
+        }
+        inner.spectrum = None;
+    }
+
+    /// Attach or detach the `spectrum` element on the live pipeline, so
+    /// turning the visualizer off also stops the FFT work.
+    pub fn set_spectrum_enabled(&self, enabled: bool) {
+        let mut inner = self.inner.borrow_mut();
+        let Some(pipeline) = inner.pipeline.clone() else {
+            return;
+        };
+        match (enabled, inner.spectrum.is_some()) {
+            (true, false) => {
+                if let Some(spectrum) = make_spectrum() {
+                    pipeline.set_property("audio-filter", &spectrum);
+                    inner.spectrum = Some(spectrum);
+                }
+            }
+            (false, true) => {
+                pipeline.set_property("audio-filter", None::<gst::Element>);
+                inner.spectrum = None;
+            }
+            _ => {}
         }
     }
 
@@ -180,15 +216,11 @@ impl Player {
             }
         }
         // Real analyzer data. The element is in gst-plugins-good; if it's
-        // missing the analyzer simply stays flat.
-        if let Ok(spectrum) = gst::ElementFactory::make("spectrum")
-            .property("bands", SPECTRUM_BANDS)
-            .property("threshold", SPECTRUM_THRESHOLD_DB)
-            .property("interval", 50_000_000u64)
-            .property("post-messages", true)
-            .build()
-        {
-            pipeline.set_property("audio-filter", &spectrum);
+        // missing the analyzer simply stays flat. Skipped entirely when the
+        // user has turned the analyzer off.
+        let spectrum = if opts.spectrum { make_spectrum() } else { None };
+        if let Some(spectrum) = &spectrum {
+            pipeline.set_property("audio-filter", spectrum);
         }
         pipeline.set_property("volume", linear_volume(opts.volume));
 
@@ -240,6 +272,7 @@ impl Player {
         inner.pipeline = Some(pipeline);
         inner.bus_guard = Some(guard);
         inner.safety_timeout = safety_timeout;
+        inner.spectrum = spectrum;
         Ok(())
     }
 

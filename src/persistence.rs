@@ -52,6 +52,8 @@ pub struct SavedData {
     pub disable_audio_buffer: bool,
     #[serde(default = "default_analyzer_type")]
     pub analyzer_type: String,
+    #[serde(default = "default_true")]
+    pub analyzer_enabled: bool,
     #[serde(default = "default_volume")]
     pub volume: f64,
     #[serde(default)]
@@ -186,8 +188,17 @@ mod tests {
         assert_eq!(data.custom_tags, ["rock"]);
         assert_eq!(data.volume, 0.5);
         assert!(data.hide_broken && data.auto_update && data.prefer_high_bitrate);
+        assert!(data.analyzer_enabled);
         assert!(!data.allow_local_streams);
         assert_eq!((data.window_width, data.window_height), (1280, 800));
         assert_eq!(SavedData::default().audio_sink, "autoaudiosink");
+    }
+
+    #[test]
+    fn analyzer_switch_persists() {
+        let data: SavedData = serde_json::from_str(r#"{"analyzer_enabled":false}"#).unwrap();
+        assert!(!data.analyzer_enabled);
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains(r#""analyzer_enabled":false"#));
     }
 }

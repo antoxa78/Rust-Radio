@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.5.1
+
+### New Features
+- **Spectrum analyzer can be turned off**: a new “Show Spectrum Analyzer” switch in Preferences hides the player-bar visualizer and stops the GStreamer FFT work. The style selector is disabled while the analyzer is off.
+
+### Bug Fixes
+- **The sync date now updates after clicking “Sync”**: the Preferences statistics refresh live, and the timestamp records when this app last fetched data instead of radio-browser’s own (often much older) last-change time.
+- **Favourite stars change colour**: adding a station shows a gold filled star in station rows and the player bar, with tooltips that match the current state.
+
+### Performance
+- Analyzer frequency ranges are computed once and spectrum frames no longer allocate a `Vec` on every update.
+- The extra `/json/stats` request after each station-list refresh was removed.
+
+### Under the Hood
+- Dead-code audit: no unused functions, fields, modules or enum variants.
+
 ## v1.5.0
 
 ### New Features

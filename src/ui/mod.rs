@@ -45,6 +45,7 @@ pub struct Prefs {
     pub auto_update: bool,
     pub allow_local_streams: bool,
     pub analyzer_type: AnalyzerType,
+    pub analyzer_enabled: bool,
     pub custom_tags: Vec<String>,
     pub audio_sink: String,
     pub disable_video_streams: bool,
@@ -141,6 +142,7 @@ pub fn build(app: &adw::Application) {
         auto_update: saved.auto_update,
         allow_local_streams: saved.allow_local_streams,
         analyzer_type: AnalyzerType::parse(&saved.analyzer_type),
+        analyzer_enabled: saved.analyzer_enabled,
         custom_tags: saved.custom_tags.clone(),
         audio_sink: saved.audio_sink.clone(),
         disable_video_streams: saved.disable_video_streams,
@@ -205,6 +207,25 @@ fn markup(text: &str) -> String {
     glib::markup_escape_text(text).to_string()
 }
 
+/// Filled star in the theme's warning (gold) colour when favourited.
+fn set_favorite_star(button: &gtk::Button, active: bool) {
+    button.set_icon_name(if active {
+        "starred-symbolic"
+    } else {
+        "non-starred-symbolic"
+    });
+    button.set_tooltip_text(Some(if active {
+        "Remove from favourites"
+    } else {
+        "Add to favourites"
+    }));
+    if active {
+        button.add_css_class("warning");
+    } else {
+        button.remove_css_class("warning");
+    }
+}
+
 fn local_time_string() -> String {
     glib::DateTime::now_local()
         .ok()
@@ -246,6 +267,7 @@ impl App {
     fn init(self: &Rc<Self>, app: &adw::Application) {
         let w = &self.w;
         w.analyzer.add_css_class("accent");
+        w.analyzer.set_visible(self.prefs.borrow().analyzer_enabled);
         w.volume_scale.set_value(self.prefs.borrow().volume);
         self.update_volume_icon();
         if !self.st.borrow().last_sync.is_empty() {
@@ -295,6 +317,7 @@ impl App {
             disable_video_streams: p.disable_video_streams,
             disable_audio_buffer: p.disable_audio_buffer,
             analyzer_type: p.analyzer_type.as_str().to_string(),
+            analyzer_enabled: p.analyzer_enabled,
             volume: p.volume,
             last_stations_loaded: st.last_count,
             prefer_high_bitrate: p.prefer_high_bitrate,
@@ -729,8 +752,7 @@ impl App {
                             CategoryKind::Countries => st.cached_countries = Some(items.clone()),
                         }
                     }
-                    me.w.updated_label
-                        .set_text(&format!("Last update: {}", local_time_string()));
+                    me.mark_synced();
                     me.render_categories(kind, items);
                 }
                 Some(Err(err)) => me.show_error("Couldn't load categories", &err),
@@ -866,7 +888,7 @@ impl App {
                     if !unchanged {
                         me.set_station_list(stations, limit, has_more, refreshing);
                     }
-                    me.refresh_sync_time();
+                    me.mark_synced();
                 }
                 Some(Err(err)) => {
                     if refreshing {
@@ -880,16 +902,16 @@ impl App {
         });
     }
 
-    fn refresh_sync_time(self: &Rc<Self>) {
-        let (fut, _) = api::run(api::fetch_last_change_time());
-        let me = self.clone();
-        glib::spawn_future_local(async move {
-            if let Some(Some(time)) = fut.await {
-                me.w.updated_label.set_text(&format!("DB synced: {}", time));
-                me.st.borrow_mut().last_sync = time;
-                me.save();
-            }
-        });
+    /// Record a completed list refresh. The timestamp is when *this app*
+    /// fetched the data, not radio-browser's own last-change time (which can
+    /// stay unchanged for days and made "Sync" look like it did nothing).
+    fn mark_synced(self: &Rc<Self>) {
+        let time = local_time_string();
+        self.w
+            .updated_label
+            .set_text(&format!("DB synced: {}", time));
+        self.st.borrow_mut().last_sync = time;
+        self.save();
     }
 
     fn set_station_list(
@@ -1112,24 +1134,15 @@ impl App {
         let view = self.st.borrow().view.clone();
         if view != View::Favorites {
             let star = gtk::Button::builder()
-                .icon_name(if is_fav {
-                    "starred-symbolic"
-                } else {
-                    "non-starred-symbolic"
-                })
                 .css_classes(vec!["flat".to_string()])
-                .tooltip_text("Toggle favourite")
                 .valign(gtk::Align::Center)
                 .build();
+            set_favorite_star(&star, is_fav);
             let me = self.clone();
             let s = station.clone();
             star.connect_clicked(move |btn| {
                 let now_fav = me.toggle_favorite(&s);
-                btn.set_icon_name(if now_fav {
-                    "starred-symbolic"
-                } else {
-                    "non-starred-symbolic"
-                });
+                set_favorite_star(btn, now_fav);
             });
             row.add_suffix(&star);
         }
@@ -1278,11 +1291,7 @@ impl App {
             .current
             .as_ref()
             .is_some_and(|c| st.favorites.iter().any(|f| f.same_as(c)));
-        self.w.fav_btn.set_icon_name(if is_fav {
-            "starred-symbolic"
-        } else {
-            "non-starred-symbolic"
-        });
+        set_favorite_star(&self.w.fav_btn, is_fav);
         self.w.fav_btn.set_sensitive(st.current.is_some());
     }
 
@@ -1662,6 +1671,7 @@ impl App {
                 prebuffer: !p.disable_audio_buffer,
                 bitrate_kbps: station.bitrate,
                 volume: p.volume,
+                spectrum: p.analyzer_enabled,
             }
         };
         if let Err(err) = self.player.play(&station.url_resolved, &opts) {
@@ -1726,6 +1736,9 @@ impl App {
                 self.update_mpris();
             }
             PlayerEvent::Spectrum(magnitudes) => {
+                if !self.prefs.borrow().analyzer_enabled {
+                    return;
+                }
                 let rate = self.st.borrow().meta.sample_rate;
                 self.analyzer.borrow_mut().push(&magnitudes, rate);
                 self.w.analyzer.queue_draw();
@@ -1911,7 +1924,7 @@ impl App {
 
     // Analyzer fall-off when playback stops.
     fn start_decay(self: &Rc<Self>) {
-        if self.decay_timer.borrow().is_some() {
+        if !self.prefs.borrow().analyzer_enabled || self.decay_timer.borrow().is_some() {
             return;
         }
         let me = self.clone();

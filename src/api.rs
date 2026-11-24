@@ -417,18 +417,6 @@ pub async fn fetch_station_page(
     Ok((apply_bitrate_query_locally(&path, stations), has_more))
 }
 
-#[derive(serde::Deserialize)]
-struct Stats {
-    lastchangetime: String,
-}
-
-pub async fn fetch_last_change_time() -> Option<String> {
-    get_json::<Stats>("/json/stats")
-        .await
-        .ok()
-        .map(|s| s.lastchangetime)
-}
-
 /// radio-browser asks clients to report each station play ("click
 /// counting"), which feeds its popularity rankings.
 pub fn count_click(stationuuid: &str) {
